@@ -120,7 +120,7 @@ func main() {
 	}
 
 	fmt.Println("==================================================")
-	fmt.Printf("AUTH KEY: %s\n", cfg.AuthKey)
+	fmt.Println("AUTH KEY: generated and saved to data/config.json")
 	fmt.Printf("DB Host: %s:%d\n", cfg.DBConfig.Host, cfg.DBConfig.Port)
 	fmt.Printf("DB Name: %s\n", cfg.DBConfig.DBName)
 	fmt.Println("==================================================")

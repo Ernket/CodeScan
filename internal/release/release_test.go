@@ -37,7 +37,7 @@ func TestCollectReleaseFilesExcludesLocalArtifacts(t *testing.T) {
 
 func TestScanFilesFlagsSecrets(t *testing.T) {
 	root := t.TempDir()
-	mustWriteFile(t, root, "data/config.example.json", `{"api_key":"replace-with-api-key","password":"","auth_key":"replace-with-generated-auth-key"}`)
+	mustWriteFile(t, root, "data/config.example.json", `{"api_key":"replace-with-api-key","password":""}`)
 
 	unsafeKey := "sk-" + "abcdef1234567890abcdef1234567890"
 	mustWriteFile(t, root, "unsafe.json", "{\n  \"auth_key\": \"abc123\",\n  \"password\": \"rootpw\",\n  \"api_key\": \""+unsafeKey+"\"\n}\n")

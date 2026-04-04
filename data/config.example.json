@@ -1,5 +1,4 @@
 {
-  "auth_key": "replace-with-generated-auth-key",
   "db_config": {
     "host": "127.0.0.1",
     "port": 3306,

@@ -73,6 +73,8 @@ cd /tmp && wget https://go.dev/dl/go1.23.3.linux-amd64.tar.gz && sudo rm -rf /us
 go run ./cmd/init
 ```
 
+执行初始化后，程序会自动生成 `auth_key` 并写入本地 `data/config.json`，不需要手动在示例配置里填写固定值。
+
 启动后端：
 
 ```bash
@@ -98,6 +100,7 @@ npm run build
 
 - 实际运行配置请保存在本地 `data/config.json`。
 - 开源仓库中提供的是安全示例文件 `data/config.example.json`。
+- `auth_key` 会在执行 `go run ./cmd/init` 时自动生成并写入本地配置文件。
 - 后端支持通过环境变量覆盖关键配置，例如：
   - `CODESCAN_AUTH_KEY`
   - `CODESCAN_DB_PASSWORD`
