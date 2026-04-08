@@ -944,7 +944,7 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 			fmt.Printf("CRITICAL PANIC in runAIScan: %v\n", r)
 			task.Status = "failed"
 			task.Result = fmt.Sprintf("Internal Server Error (Panic): %v", r)
-			database.DB.Save(task)
+			saveTaskRecord(task)
 		}
 	}()
 
@@ -975,7 +975,7 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 			if !resume {
 				s.Logs = []string{} // Reset logs for a fresh run only.
 			}
-			database.DB.Save(&s)
+			saveTaskStageRecord(&s)
 		}
 		currentStage = &s
 	}
@@ -990,9 +990,9 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 		// gorm:"serializer:json" — Update() bypasses the serializer and
 		// silently fails to write []string to a JSON column.
 		if currentStage != nil {
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		} else {
-			database.DB.Save(task)
+			saveTaskRecord(task)
 		}
 		pendingLogs = 0
 		lastFlushTime = time.Now()
@@ -1026,7 +1026,7 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 	}
 
 	task.Status = "running"
-	database.DB.Model(task).Update("status", "running")
+	updateTaskStatus(task, "running")
 
 	if resume {
 		logFunc("Task resumed. Restoring AI runtime...")
@@ -1037,9 +1037,9 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 	defer func() {
 		// Flush any pending logs and final save
 		flushLogs()
-		database.DB.Save(task)
+		saveTaskRecord(task)
 		if currentStage != nil {
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		}
 	}()
 
@@ -1864,11 +1864,11 @@ Base Path: %s
 		failMessage := "Prompt preparation failed: " + promptErr.Error()
 		task.Status = "failed"
 		task.Result = failMessage
-		database.DB.Save(task)
+		saveTaskRecord(task)
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = failMessage
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		}
 		logFunc(failMessage)
 		return
@@ -1886,11 +1886,11 @@ Base Path: %s
 	if err != nil {
 		task.Status = "failed"
 		task.Result = "Runtime initialization failed: " + err.Error()
-		database.DB.Save(task)
+		saveTaskRecord(task)
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = task.Result
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		}
 		logFunc(task.Result)
 		return
@@ -1898,11 +1898,11 @@ Base Path: %s
 	if err := session.markStatus(runtimeStatusRunning); err != nil {
 		task.Status = "failed"
 		task.Result = "Runtime initialization failed: " + err.Error()
-		database.DB.Save(task)
+		saveTaskRecord(task)
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = task.Result
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		}
 		logFunc(task.Result)
 		return
@@ -1915,11 +1915,11 @@ Base Path: %s
 		message := prefix + runErr.Error()
 		task.Status = "failed"
 		task.Result = message
-		database.DB.Save(task)
+		saveTaskRecord(task)
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = message
-			database.DB.Save(currentStage)
+			saveTaskStageRecord(currentStage)
 		}
 		_ = session.markStatus(runtimeStatusFailed)
 		logFunc(message)
@@ -1940,10 +1940,10 @@ Base Path: %s
 	for i := 0; i < maxIterations; i++ {
 		if pauseRequested(task.ID, stage) {
 			task.Status = "paused"
-			database.DB.Model(task).Update("status", "paused")
+			updateTaskStatus(task, "paused")
 			if currentStage != nil {
 				currentStage.Status = "paused"
-				database.DB.Save(currentStage)
+				saveTaskStageRecord(currentStage)
 			}
 			_ = session.markStatus(runtimeStatusPaused)
 			logFunc("Pause requested. Runtime state saved.")
@@ -2060,13 +2060,13 @@ Base Path: %s
 				currentStage.UpdatedAt = time.Now()
 				currentStage.OutputJSON = outputJSON
 				currentStage.Meta = meta
-				database.DB.Save(currentStage)
+				saveTaskStageRecord(currentStage)
 			} else {
 				task.Result = msg.Content
 				task.OutputJSON = outputJSON
 			}
 
-			database.DB.Save(task)
+			saveTaskRecord(task)
 			logFunc("Analysis completed.")
 			return
 		}
@@ -2246,10 +2246,10 @@ Base Path: %s
 
 			if pauseRequested(task.ID, stage) {
 				task.Status = "paused"
-				database.DB.Model(task).Update("status", "paused")
+				updateTaskStatus(task, "paused")
 				if currentStage != nil {
 					currentStage.Status = "paused"
-					database.DB.Save(currentStage)
+					saveTaskStageRecord(currentStage)
 				}
 				_ = session.markStatus(runtimeStatusPaused)
 				logFunc("Pause requested. Runtime state saved.")
@@ -2339,11 +2339,11 @@ Base Path: %s
 		currentStage.Result = lastContent
 		currentStage.UpdatedAt = time.Now()
 		currentStage.OutputJSON = outputJSON
-		database.DB.Save(currentStage)
+		saveTaskStageRecord(currentStage)
 	} else {
 		task.OutputJSON = outputJSON
 	}
 
-	database.DB.Save(task)
+	saveTaskRecord(task)
 	logFunc("Analysis finished (limit reached).")
 }

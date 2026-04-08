@@ -7,6 +7,8 @@ import (
 
 	"codescan/internal/database"
 	"codescan/internal/model"
+
+	"gorm.io/gorm"
 )
 
 func RunAIScan(task *model.Task, stage string) {
@@ -47,6 +49,8 @@ func pauseRequested(taskID, stage string) bool {
 		if task.Status == "paused" {
 			return true
 		}
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		return true
 	}
 
 	if stage != "init" {

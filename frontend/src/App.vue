@@ -770,7 +770,17 @@ const createTask = async () => {
   }
 }
 
+const getTaskForDelete = (id) => {
+  if (selectedTask.value?.id === id) return selectedTask.value
+  return tasks.value.find(task => task.id === id) || null
+}
+
 const deleteTask = async (id) => {
+  const task = getTaskForDelete(id)
+  if (task?.status === 'running') {
+    alert(t('alerts.pauseTaskBeforeDelete'))
+    return
+  }
   if (!confirm(t('confirm.deleteTask'))) return
   try {
     await axios.delete(`${API_URL}/tasks/${id}`, authConfig())
@@ -778,8 +788,12 @@ const deleteTask = async (id) => {
       goDashboard()
     }
     await fetchData()
-  } catch {
-    alert(t('alerts.failedToDeleteTask'))
+  } catch (e) {
+    if (e.response?.status === 409) {
+      alert(t('alerts.pauseTaskBeforeDelete'))
+      return
+    }
+    alert(t('alerts.failedToDeleteTask', { message: e.response?.data?.error || e.message }))
   }
 }
 

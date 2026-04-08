@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -124,16 +126,77 @@ func UploadHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, task)
 }
 
+var (
+	errTaskDeleteNotFound = errors.New("task not found")
+	errTaskDeleteRunning  = errors.New("task is running")
+
+	newTaskDeletionStore = func(db *gorm.DB) taskDeletionStore {
+		return gormTaskDeletionStore{db: db}
+	}
+	removeTaskPath = os.RemoveAll
+)
+
+type taskDeletionStore interface {
+	DeleteTask(id string) (model.Task, error)
+}
+
+type gormTaskDeletionStore struct {
+	db *gorm.DB
+}
+
+func (s gormTaskDeletionStore) DeleteTask(id string) (model.Task, error) {
+	var task model.Task
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.First(&task, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errTaskDeleteNotFound
+			}
+			return err
+		}
+
+		if task.Status == "running" {
+			return errTaskDeleteRunning
+		}
+
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.TaskStage{}).Error; err != nil {
+			return err
+		}
+
+		deleteResult := tx.Delete(&task)
+		if deleteResult.Error != nil {
+			return deleteResult.Error
+		}
+		if deleteResult.RowsAffected == 0 {
+			return errTaskDeleteNotFound
+		}
+
+		return nil
+	})
+
+	return task, err
+}
+
 func DeleteTaskHandler(c *gin.Context) {
 	id := c.Param("id")
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
+
+	task, err := newTaskDeletionStore(database.DB).DeleteTask(id)
+	switch {
+	case errors.Is(err, errTaskDeleteNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	case errors.Is(err, errTaskDeleteRunning):
+		c.JSON(http.StatusConflict, gin.H{"error": "Task is running. Pause it before deleting."})
+		return
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
 		return
 	}
 
-	database.DB.Delete(&task)
-	os.RemoveAll(task.GetBasePath())
+	taskPath := task.GetBasePath()
+	if err := removeTaskPath(taskPath); err != nil {
+		log.Printf("warning: failed to remove task data for %s at %s: %v", task.ID, taskPath, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
