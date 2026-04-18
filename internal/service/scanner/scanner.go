@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"codescan/internal/config"
@@ -17,6 +19,69 @@ import (
 
 	"github.com/sashabaranov/go-openai"
 )
+
+const (
+	defaultAIRequestInitialTimeout = 180 * time.Second
+	defaultAIRequestTimeoutStep    = 60 * time.Second
+	defaultAIRequestMaxAttempts    = 10
+)
+
+var (
+	aiClientFactory         = newAIClient
+	aiRequestInitialTimeout = defaultAIRequestInitialTimeout
+	aiRequestTimeoutStep    = defaultAIRequestTimeoutStep
+	aiRequestMaxAttempts    = defaultAIRequestMaxAttempts
+	aiRequestSleep          = sleepWithContext
+	aiRequestTimeoutMemory  = newAIRequestTimeoutMemory()
+)
+
+type aiRequestTimeoutStore struct {
+	mu        sync.RWMutex
+	baselines map[string]time.Duration
+}
+
+func newAIRequestTimeoutMemory() *aiRequestTimeoutStore {
+	return &aiRequestTimeoutStore{
+		baselines: map[string]time.Duration{},
+	}
+}
+
+func (s *aiRequestTimeoutStore) load(key string, fallback, max time.Duration) time.Duration {
+	if s == nil {
+		return clampAIRequestTimeout(fallback, fallback, max)
+	}
+
+	s.mu.RLock()
+	timeout, ok := s.baselines[key]
+	s.mu.RUnlock()
+	if !ok {
+		timeout = fallback
+	}
+
+	return clampAIRequestTimeout(timeout, fallback, max)
+}
+
+func (s *aiRequestTimeoutStore) store(key string, timeout, fallback, max time.Duration) {
+	if s == nil || key == "" {
+		return
+	}
+
+	timeout = clampAIRequestTimeout(timeout, fallback, max)
+
+	s.mu.Lock()
+	s.baselines[key] = timeout
+	s.mu.Unlock()
+}
+
+func (s *aiRequestTimeoutStore) reset() {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.baselines = map[string]time.Duration{}
+	s.mu.Unlock()
+}
 
 // newAIClient creates an OpenAI client from global config.
 func newAIClient() *openai.Client {
@@ -319,6 +384,332 @@ func currentEvidenceIndex(store *evidenceStore) string {
 	return store.compactIndex(evidenceIndexLimit)
 }
 
+type chatCompletionRetryHooks struct {
+	onRetry        func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool)
+	onNonRetryable func(attempt, maxAttempts int, attemptTimeout time.Duration, err error)
+}
+
+var errEmptyChatCompletionStream = errors.New("chat completion stream ended without any choice data")
+
+type chatCompletionStreamAccumulator struct {
+	response          openai.ChatCompletionResponse
+	choice            openai.ChatCompletionChoice
+	choiceInitialized bool
+	receivedChunk     bool
+}
+
+func newChatCompletionStreamAccumulator(model string) *chatCompletionStreamAccumulator {
+	return &chatCompletionStreamAccumulator{
+		response: openai.ChatCompletionResponse{
+			Model: strings.TrimSpace(model),
+		},
+	}
+}
+
+func (a *chatCompletionStreamAccumulator) addChunk(chunk openai.ChatCompletionStreamResponse) {
+	a.receivedChunk = true
+
+	if chunk.ID != "" {
+		a.response.ID = chunk.ID
+	}
+	if chunk.Object != "" {
+		a.response.Object = chunk.Object
+	}
+	if chunk.Created != 0 {
+		a.response.Created = chunk.Created
+	}
+	if chunk.Model != "" {
+		a.response.Model = chunk.Model
+	}
+	if chunk.SystemFingerprint != "" {
+		a.response.SystemFingerprint = chunk.SystemFingerprint
+	}
+	if chunk.Usage != nil {
+		a.response.Usage = *chunk.Usage
+	}
+	if len(chunk.PromptFilterResults) > 0 {
+		a.response.PromptFilterResults = chunk.PromptFilterResults
+	}
+	if len(chunk.Choices) == 0 {
+		return
+	}
+
+	choice := chunk.Choices[0]
+	if !a.choiceInitialized {
+		a.choiceInitialized = true
+		a.choice.Index = choice.Index
+	}
+
+	if choice.Delta.Role != "" {
+		a.choice.Message.Role = choice.Delta.Role
+	}
+	if choice.Delta.Content != "" {
+		a.choice.Message.Content += choice.Delta.Content
+	}
+	if choice.Delta.Refusal != "" {
+		a.choice.Message.Refusal += choice.Delta.Refusal
+	}
+	if choice.Delta.ReasoningContent != "" {
+		a.choice.Message.ReasoningContent += choice.Delta.ReasoningContent
+	}
+	if choice.Delta.FunctionCall != nil {
+		if a.choice.Message.FunctionCall == nil {
+			a.choice.Message.FunctionCall = &openai.FunctionCall{}
+		}
+		if choice.Delta.FunctionCall.Name != "" {
+			a.choice.Message.FunctionCall.Name += choice.Delta.FunctionCall.Name
+		}
+		if choice.Delta.FunctionCall.Arguments != "" {
+			a.choice.Message.FunctionCall.Arguments += choice.Delta.FunctionCall.Arguments
+		}
+	}
+	if len(choice.Delta.ToolCalls) > 0 {
+		a.choice.Message.ToolCalls = mergeChatCompletionToolCalls(a.choice.Message.ToolCalls, choice.Delta.ToolCalls)
+	}
+	if choice.FinishReason != "" {
+		a.choice.FinishReason = choice.FinishReason
+	}
+}
+
+func (a *chatCompletionStreamAccumulator) finalize() (openai.ChatCompletionResponse, error) {
+	if !a.choiceInitialized {
+		return openai.ChatCompletionResponse{}, errEmptyChatCompletionStream
+	}
+	if a.choice.Message.Role == "" {
+		a.choice.Message.Role = openai.ChatMessageRoleAssistant
+	}
+	if a.response.Object == "" {
+		a.response.Object = "chat.completion"
+	}
+	a.response.Choices = []openai.ChatCompletionChoice{a.choice}
+	return a.response, nil
+}
+
+func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.ToolCall) []openai.ToolCall {
+	for _, delta := range deltas {
+		idx := len(existing)
+		if delta.Index != nil && *delta.Index >= 0 {
+			idx = *delta.Index
+		}
+		for len(existing) <= idx {
+			existing = append(existing, openai.ToolCall{
+				Type: openai.ToolTypeFunction,
+			})
+		}
+
+		target := &existing[idx]
+		if delta.ID != "" {
+			target.ID = delta.ID
+		}
+		if delta.Type != "" {
+			target.Type = delta.Type
+		} else if target.Type == "" {
+			target.Type = openai.ToolTypeFunction
+		}
+		if delta.Function.Name != "" {
+			target.Function.Name += delta.Function.Name
+		}
+		if delta.Function.Arguments != "" {
+			target.Function.Arguments += delta.Function.Arguments
+		}
+	}
+
+	return existing
+}
+
+func createChatCompletion(ctx context.Context, client *openai.Client, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, bool, error) {
+	resp, receivedChunk, err := createChatCompletionStream(ctx, client, req)
+	if err == nil {
+		return resp, receivedChunk, nil
+	}
+	if receivedChunk || !isStreamUnsupportedAIError(err) {
+		return openai.ChatCompletionResponse{}, receivedChunk, err
+	}
+
+	resp, err = client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return openai.ChatCompletionResponse{}, false, err
+	}
+	return resp, false, nil
+}
+
+func createChatCompletionStream(ctx context.Context, client *openai.Client, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, bool, error) {
+	stream, err := client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return openai.ChatCompletionResponse{}, false, err
+	}
+	defer stream.Close()
+
+	accumulator := newChatCompletionStreamAccumulator(req.Model)
+	for {
+		chunk, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			return openai.ChatCompletionResponse{}, accumulator.receivedChunk, recvErr
+		}
+		accumulator.addChunk(chunk)
+	}
+
+	resp, err := accumulator.finalize()
+	return resp, accumulator.receivedChunk, err
+}
+
+func isStreamUnsupportedAIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errEmptyChatCompletionStream) || errors.Is(err, openai.ErrTooManyEmptyStreamMessages) {
+		return true
+	}
+
+	errText := strings.ToLower(err.Error())
+	streamHints := []string{
+		"stream",
+		"streaming",
+		"event-stream",
+		"text/event-stream",
+		"sse",
+	}
+	unsupportedHints := []string{
+		"unsupported",
+		"not supported",
+		"not support",
+		"not implemented",
+		"disabled",
+		"invalid",
+	}
+	statusHints := []string{
+		"status code: 400",
+		"status code: 404",
+		"status code: 405",
+		"status code: 415",
+		"status code: 422",
+	}
+
+	return containsAny(errText, streamHints...) && (containsAny(errText, unsupportedHints...) || containsAny(errText, statusHints...))
+}
+
+func containsAny(value string, needles ...string) bool {
+	for _, needle := range needles {
+		if needle != "" && strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func createChatCompletionWithRetry(
+	ctx context.Context,
+	client *openai.Client,
+	req openai.ChatCompletionRequest,
+	hooks chatCompletionRetryHooks,
+) (openai.ChatCompletionResponse, error) {
+	attempts := aiRequestMaxAttempts
+	if attempts <= 0 {
+		attempts = defaultAIRequestMaxAttempts
+	}
+	initialTimeout := aiRequestInitialTimeout
+	if initialTimeout <= 0 {
+		initialTimeout = defaultAIRequestInitialTimeout
+	}
+	timeoutStep := aiRequestTimeoutStep
+	if timeoutStep <= 0 {
+		timeoutStep = defaultAIRequestTimeoutStep
+	}
+	sleepFn := aiRequestSleep
+	if sleepFn == nil {
+		sleepFn = sleepWithContext
+	}
+	maxTimeout := maxAIRequestTimeout(initialTimeout, timeoutStep, attempts)
+	timeoutMemoryKey := aiRequestTimeoutMemoryKey(config.AI.BaseURL, req.Model)
+	currentTimeout := aiRequestTimeoutMemory.load(timeoutMemoryKey, initialTimeout, maxTimeout)
+
+	var resp openai.ChatCompletionResponse
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		attemptTimeout := currentTimeout
+		ctxReq, cancel := context.WithTimeout(ctx, attemptTimeout)
+		var receivedChunk bool
+		resp, receivedChunk, err = createChatCompletion(ctxReq, client, req)
+		cancel()
+		if err == nil {
+			return resp, nil
+		}
+		if receivedChunk {
+			if hooks.onNonRetryable != nil {
+				hooks.onNonRetryable(attempt, attempts, attemptTimeout, err)
+			}
+			return openai.ChatCompletionResponse{}, err
+		}
+		if !isRetryableAIError(err) {
+			if hooks.onNonRetryable != nil {
+				hooks.onNonRetryable(attempt, attempts, attemptTimeout, err)
+			}
+			return openai.ChatCompletionResponse{}, err
+		}
+		if attempt == attempts {
+			return openai.ChatCompletionResponse{}, err
+		}
+
+		retryDelay := time.Duration(attempt) * time.Second
+		nextTimeout := attemptTimeout
+		timeoutLike := isAIRequestTimeout(err)
+		if timeoutLike {
+			nextTimeout = clampAIRequestTimeout(attemptTimeout+timeoutStep, initialTimeout, maxTimeout)
+			currentTimeout = nextTimeout
+			aiRequestTimeoutMemory.store(timeoutMemoryKey, nextTimeout, initialTimeout, maxTimeout)
+		}
+		if hooks.onRetry != nil {
+			hooks.onRetry(attempt, attempts, attemptTimeout, nextTimeout, retryDelay, err, timeoutLike)
+		}
+		if !sleepFn(ctx, retryDelay) {
+			return openai.ChatCompletionResponse{}, ctx.Err()
+		}
+	}
+
+	return openai.ChatCompletionResponse{}, err
+}
+
+func aiRequestTimeoutMemoryKey(baseURL, model string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = strings.TrimSpace(config.AI.Model)
+	}
+	return baseURL + "\n" + model
+}
+
+func maxAIRequestTimeout(initial, step time.Duration, attempts int) time.Duration {
+	if initial <= 0 {
+		initial = defaultAIRequestInitialTimeout
+	}
+	if step <= 0 {
+		step = defaultAIRequestTimeoutStep
+	}
+	if attempts <= 1 {
+		return initial
+	}
+	return initial + (time.Duration(attempts-1) * step)
+}
+
+func clampAIRequestTimeout(value, fallback, max time.Duration) time.Duration {
+	if fallback <= 0 {
+		fallback = defaultAIRequestInitialTimeout
+	}
+	if max < fallback {
+		max = fallback
+	}
+	if value < fallback {
+		return fallback
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
 func isAIRequestTimeout(err error) bool {
 	if err == nil {
 		return false
@@ -327,7 +718,9 @@ func isAIRequestTimeout(err error) bool {
 		return true
 	}
 	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "context deadline exceeded") || strings.Contains(errText, "timeout")
+	return strings.Contains(errText, "context deadline exceeded") ||
+		strings.Contains(errText, "timeout") ||
+		strings.Contains(errText, "status code: 524")
 }
 
 func resolveToolPath(basePath string, path string) (string, error) {
@@ -542,6 +935,7 @@ func isRetryableAIError(err error) bool {
 		"status code: 502",
 		"status code: 503",
 		"status code: 504",
+		"status code: 524",
 		"too many requests",
 		"rate limit",
 	}
@@ -614,12 +1008,10 @@ IMPORTANT: Do NOT use any tools. Just provide the summary text.`,
 	contextToSummarize = append(contextToSummarize, window.selectedMessages...)
 	contextToSummarize = append(contextToSummarize, summaryRequest...)
 
-	ctxSumm, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	resp, err := client.CreateChatCompletion(ctxSumm, openai.ChatCompletionRequest{
+	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
 		Model:    config.AI.Model,
 		Messages: contextToSummarize,
-	})
+	}, chatCompletionRetryHooks{})
 
 	if err != nil {
 		log.Printf("Error compressing history: %v. Resetting to prompt plus summary.", err)
@@ -685,7 +1077,7 @@ CURRENT STAGE: %s`, stage)
 }
 
 func RepairJSON(content string, stage string) (string, error) {
-	client := newAIClient()
+	client := aiClientFactory()
 
 	schemaInstruction := ""
 	if stage == "injection" {
@@ -920,14 +1312,12 @@ RAW_DATA>>>>
 `, schemaInstruction, repairChineseNarrativeRules(stage), content)
 
 	ctx := context.Background()
-	ctxReq, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	resp, err := client.CreateChatCompletion(ctxReq, openai.ChatCompletionRequest{
+	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
 		Model: config.AI.Model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},
-	})
+	}, chatCompletionRetryHooks{})
 
 	if err != nil {
 		return "", err
@@ -1043,7 +1433,7 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 		}
 	}()
 
-	client := newAIClient()
+	client := aiClientFactory()
 	toolCache := map[string]string{}
 	toolCacheOrder := []string{}
 	maxToolCacheEntries := 200
@@ -1929,8 +2319,6 @@ Base Path: %s
 	const maxIterations = 200
 	softLimitBytes := config.Scanner.ContextCompression.SoftLimitBytes
 	hardLimitBytes := config.Scanner.ContextCompression.HardLimitBytes
-	currentAIRequestTimeout := 180 * time.Second
-	const aiRequestTimeoutStep = 60 * time.Second
 	logFunc(fmt.Sprintf(
 		"Context limits configured: soft=%d bytes, hard=%d bytes, summary_window=%d messages.",
 		softLimitBytes,
@@ -1977,53 +2365,44 @@ Base Path: %s
 
 		flushLogs()
 
-		maxRetries := 10
-		for retry := 0; retry < maxRetries; retry++ {
-			attemptTimeout := currentAIRequestTimeout
-			ctxReq, cancel := context.WithTimeout(ctx, attemptTimeout)
-			resp, callErr = client.CreateChatCompletion(ctxReq, openai.ChatCompletionRequest{
-				Model:    config.AI.Model,
-				Messages: messages,
-				Tools:    Tools,
-			})
-			cancel()
-			if callErr == nil {
-				break
-			}
-			if !isRetryableAIError(callErr) {
+		resp, callErr = createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+			Model:    config.AI.Model,
+			Messages: messages,
+			Tools:    Tools,
+		}, chatCompletionRetryHooks{
+			onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
+				if timeoutLike {
+					logFunc(fmt.Sprintf(
+						"AI API timeout (attempt %d/%d) after %s: %v. Increasing request timeout to %s and retrying in %d seconds...",
+						attempt,
+						maxAttempts,
+						attemptTimeout,
+						err,
+						nextTimeout,
+						int(retryDelay/time.Second),
+					))
+					return
+				}
+				logFunc(fmt.Sprintf(
+					"AI API Error (attempt %d/%d, timeout %s): %v. Retrying in %d seconds...",
+					attempt,
+					maxAttempts,
+					attemptTimeout,
+					err,
+					int(retryDelay/time.Second),
+				))
+			},
+			onNonRetryable: func(attempt, maxAttempts int, attemptTimeout time.Duration, err error) {
 				nonRetryableAbort = true
 				logFunc(fmt.Sprintf(
 					"AI API Error (attempt %d/%d, timeout %s): %v. Error is not retryable; aborting request loop.",
-					retry+1,
-					maxRetries,
+					attempt,
+					maxAttempts,
 					attemptTimeout,
-					callErr,
+					err,
 				))
-				break
-			}
-			if isAIRequestTimeout(callErr) {
-				currentAIRequestTimeout += aiRequestTimeoutStep
-				logFunc(fmt.Sprintf(
-					"AI API timeout (attempt %d/%d) after %s: %v. Increasing request timeout to %s and retrying in %d seconds...",
-					retry+1,
-					maxRetries,
-					attemptTimeout,
-					callErr,
-					currentAIRequestTimeout,
-					retry+1,
-				))
-			} else {
-				logFunc(fmt.Sprintf(
-					"AI API Error (attempt %d/%d, timeout %s): %v. Retrying in %d seconds...",
-					retry+1,
-					maxRetries,
-					attemptTimeout,
-					callErr,
-					retry+1,
-				))
-			}
-			time.Sleep(time.Duration(retry+1) * time.Second)
-		}
+			},
+		})
 
 		if callErr != nil {
 			errPrefix := "AI Error after retries: "

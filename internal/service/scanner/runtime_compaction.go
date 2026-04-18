@@ -326,83 +326,45 @@ func (s *scanSession) requestSessionMemoryUpdate(
 	transcriptText string,
 	logFunc func(string),
 ) (string, error) {
-	attempts := config.Scanner.SessionMemory.MaxRetries
-	if attempts <= 0 {
-		attempts = 1
-	}
-	timeout := time.Duration(config.Scanner.SessionMemory.RequestTimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 180 * time.Second
-	}
-	baseBackoff := time.Duration(config.Scanner.SessionMemory.RetryBackoffSeconds) * time.Second
-
-	var resp openai.ChatCompletionResponse
-	var err error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		ctxReq, cancel := context.WithTimeout(ctx, timeout)
-		resp, err = client.CreateChatCompletion(ctxReq, openai.ChatCompletionRequest{
-			Model: config.AI.Model,
-			Messages: []openai.ChatCompletionMessage{
-				{Role: openai.ChatMessageRoleUser, Content: memoryUpdatePrompt(existingMemory, transcriptText)},
-			},
-		})
-		cancel()
-		if err == nil {
-			if len(resp.Choices) == 0 {
-				return "", nil
+	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+		Model: config.AI.Model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: memoryUpdatePrompt(existingMemory, transcriptText)},
+		},
+	}, chatCompletionRetryHooks{
+		onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
+			if logFunc == nil {
+				return
 			}
-			return strings.TrimSpace(resp.Choices[0].Message.Content), nil
-		}
-		if !isRetryableAIError(err) || attempt == attempts {
-			break
-		}
-
-		retryDelay := sessionMemoryRetryDelay(baseBackoff, attempt)
-		if logFunc != nil {
-			if isAIRequestTimeout(err) {
-				if retryDelay > 0 {
-					logFunc(fmt.Sprintf(
-						"Session memory update timeout (attempt %d/%d, timeout %s): %v. Retrying in %s...",
-						attempt,
-						attempts,
-						timeout,
-						err,
-						retryDelay,
-					))
-				} else {
-					logFunc(fmt.Sprintf(
-						"Session memory update timeout (attempt %d/%d, timeout %s): %v. Retrying immediately...",
-						attempt,
-						attempts,
-						timeout,
-						err,
-					))
-				}
-			} else if retryDelay > 0 {
+			if timeoutLike {
 				logFunc(fmt.Sprintf(
-					"Session memory update error (attempt %d/%d, timeout %s): %v. Retrying in %s...",
+					"Session memory update timeout (attempt %d/%d) after %s: %v. Increasing request timeout to %s and retrying in %s...",
 					attempt,
-					attempts,
-					timeout,
+					maxAttempts,
+					attemptTimeout,
 					err,
+					nextTimeout,
 					retryDelay,
 				))
-			} else {
-				logFunc(fmt.Sprintf(
-					"Session memory update error (attempt %d/%d, timeout %s): %v. Retrying immediately...",
-					attempt,
-					attempts,
-					timeout,
-					err,
-				))
+				return
 			}
-		}
-		if !sleepWithContext(ctx, retryDelay) {
-			return "", ctx.Err()
-		}
+			logFunc(fmt.Sprintf(
+				"Session memory update error (attempt %d/%d, timeout %s): %v. Retrying in %s...",
+				attempt,
+				maxAttempts,
+				attemptTimeout,
+				err,
+				retryDelay,
+			))
+		},
+	})
+	if err != nil {
+		return "", err
 	}
-
-	return "", err
+	if len(resp.Choices) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
 }
 
 func (s *scanSession) maybeUpdateSessionMemory(ctx context.Context, client *openai.Client, logFunc func(string)) {
@@ -600,11 +562,35 @@ func (s *scanSession) compressHistory(ctx context.Context, client *openai.Client
 			Content: compactPrompt(),
 		})
 
-		ctxReq, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-		resp, err := client.CreateChatCompletion(ctxReq, openai.ChatCompletionRequest{
+		resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
 			Model:    config.AI.Model,
 			Messages: contextToSummarize,
+		}, chatCompletionRetryHooks{
+			onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
+				if logFunc == nil {
+					return
+				}
+				if timeoutLike {
+					logFunc(fmt.Sprintf(
+						"Context compression timeout (attempt %d/%d) after %s: %v. Increasing request timeout to %s and retrying in %s...",
+						attempt,
+						maxAttempts,
+						attemptTimeout,
+						err,
+						nextTimeout,
+						retryDelay,
+					))
+					return
+				}
+				logFunc(fmt.Sprintf(
+					"Context compression error (attempt %d/%d, timeout %s): %v. Retrying in %s...",
+					attempt,
+					maxAttempts,
+					attemptTimeout,
+					err,
+					retryDelay,
+				))
+			},
 		})
 		if err != nil {
 			summary = strings.TrimSpace(s.state.RollingSummary)

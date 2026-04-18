@@ -1,8 +1,10 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,6 +59,62 @@ func newTestAIClient(doer openai.HTTPDoer) *openai.Client {
 	return openai.NewClientWithConfig(cfg)
 }
 
+func useTestAIRequestPolicy(t *testing.T, maxAttempts int) {
+	t.Helper()
+
+	prevInitialTimeout := aiRequestInitialTimeout
+	prevTimeoutStep := aiRequestTimeoutStep
+	prevMaxAttempts := aiRequestMaxAttempts
+	prevSleep := aiRequestSleep
+
+	aiRequestInitialTimeout = defaultAIRequestInitialTimeout
+	aiRequestTimeoutStep = defaultAIRequestTimeoutStep
+	aiRequestMaxAttempts = maxAttempts
+	aiRequestSleep = func(ctx context.Context, delay time.Duration) bool {
+		return true
+	}
+	aiRequestTimeoutMemory.reset()
+
+	t.Cleanup(func() {
+		aiRequestInitialTimeout = prevInitialTimeout
+		aiRequestTimeoutStep = prevTimeoutStep
+		aiRequestMaxAttempts = prevMaxAttempts
+		aiRequestSleep = prevSleep
+		aiRequestTimeoutMemory.reset()
+	})
+}
+
+func useTestAIClientFactory(t *testing.T, factory func() *openai.Client) {
+	t.Helper()
+
+	prevFactory := aiClientFactory
+	aiClientFactory = factory
+	t.Cleanup(func() {
+		aiClientFactory = prevFactory
+	})
+}
+
+func new524Error() error {
+	return errors.New("error, status code: 524, status: 524 A Timeout Occurred")
+}
+
+func requestUsesStream(t *testing.T, req *http.Request) bool {
+	t.Helper()
+
+	if req == nil || req.Body == nil {
+		return false
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+
+	bodyText := string(body)
+	return strings.Contains(bodyText, `"stream":true`) || strings.Contains(bodyText, `"stream": true`)
+}
+
 func newChatCompletionResponse(t *testing.T, content string) *http.Response {
 	t.Helper()
 
@@ -92,6 +150,57 @@ func newChatCompletionResponse(t *testing.T, content string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(string(data))),
 	}
+}
+
+func newChatCompletionStreamResponse(t *testing.T, chunks ...openai.ChatCompletionStreamResponse) *http.Response {
+	t.Helper()
+
+	var body strings.Builder
+	for _, chunk := range chunks {
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("marshal chat completion stream response: %v", err)
+		}
+		body.WriteString("data: ")
+		body.Write(data)
+		body.WriteString("\n\n")
+	}
+	body.WriteString("data: [DONE]\n\n")
+
+	header := make(http.Header)
+	header.Set("Content-Type", "text/event-stream")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(body.String())),
+	}
+}
+
+func newChatCompletionHTTPResponse(t *testing.T, req *http.Request, content string) *http.Response {
+	t.Helper()
+
+	if requestUsesStream(t, req) {
+		return newChatCompletionStreamResponse(t, openai.ChatCompletionStreamResponse{
+			ID:                "chatcmpl-stream-test",
+			Object:            "chat.completion.chunk",
+			Created:           time.Now().Unix(),
+			Model:             "gpt-4o-mini",
+			SystemFingerprint: "fp-test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: content,
+					},
+					FinishReason: openai.FinishReasonStop,
+				},
+			},
+		})
+	}
+
+	return newChatCompletionResponse(t, content)
 }
 
 func newTestTask(t *testing.T) *model.Task {
@@ -336,9 +445,8 @@ func TestTrySessionMemoryCompactionKeepsOnlyMessagesAfterMemoryCursor(t *testing
 
 func TestMaybeUpdateSessionMemorySendsOnlyDeltaAndClearsFailureState(t *testing.T) {
 	useTestScannerConfig(t)
+	useTestAIRequestPolicy(t, 1)
 	config.AI = config.AIConfig{Model: "gpt-4o-mini"}
-	config.Scanner.SessionMemory.MaxRetries = 1
-	config.Scanner.SessionMemory.RetryBackoffSeconds = 0
 	config.Scanner.SessionMemory.FailureCooldownSeconds = 60
 
 	task := newTestTask(t)
@@ -393,7 +501,7 @@ func TestMaybeUpdateSessionMemorySendsOnlyDeltaAndClearsFailureState(t *testing.
 			t.Fatalf("expected one message in memory update request, got %d", len(payload.Messages))
 		}
 		requestContent = payload.Messages[0].Content
-		return newChatCompletionResponse(t, "# Updated Memory"), nil
+		return newChatCompletionHTTPResponse(t, req, "# Updated Memory"), nil
 	}))
 
 	session.maybeUpdateSessionMemory(context.Background(), client, nil)
@@ -424,9 +532,8 @@ func TestMaybeUpdateSessionMemorySendsOnlyDeltaAndClearsFailureState(t *testing.
 
 func TestMaybeUpdateSessionMemoryRetriesAndCoolsDownAfterFailure(t *testing.T) {
 	useTestScannerConfig(t)
+	useTestAIRequestPolicy(t, 3)
 	config.AI = config.AIConfig{Model: "gpt-4o-mini"}
-	config.Scanner.SessionMemory.MaxRetries = 3
-	config.Scanner.SessionMemory.RetryBackoffSeconds = 0
 	config.Scanner.SessionMemory.FailureCooldownSeconds = 60
 
 	task := newTestTask(t)
@@ -472,7 +579,7 @@ func TestMaybeUpdateSessionMemoryRetriesAndCoolsDownAfterFailure(t *testing.T) {
 
 	retryLogs := 0
 	for _, line := range logs {
-		if strings.Contains(line, "Retrying") {
+		if strings.Contains(line, "Increasing request timeout to") {
 			retryLogs++
 		}
 	}
@@ -495,5 +602,108 @@ func TestMaybeUpdateSessionMemoryRetriesAndCoolsDownAfterFailure(t *testing.T) {
 	}
 	if cooldownLogs != 1 {
 		t.Fatalf("expected exactly one cooldown log, got %d (%v)", cooldownLogs, logs)
+	}
+}
+
+func TestCompressHistoryRetriesTimeoutLikeErrors(t *testing.T) {
+	useTestScannerConfig(t)
+	useTestAIRequestPolicy(t, 3)
+	config.AI = config.AIConfig{Model: "gpt-4o-mini"}
+
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if err := session.appendSynthetic(openai.ChatMessageRoleAssistant, runtimeKindNormal, "finding-1", nil); err != nil {
+		t.Fatalf("append finding-1: %v", err)
+	}
+	if err := session.appendSynthetic(openai.ChatMessageRoleUser, runtimeKindNormal, "finding-2", nil); err != nil {
+		t.Fatalf("append finding-2: %v", err)
+	}
+
+	callCount := 0
+	logs := []string{}
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		if callCount < 3 {
+			return nil, new524Error()
+		}
+		return newChatCompletionHTTPResponse(t, req, "retried summary"), nil
+	}))
+
+	err = session.compressHistory(context.Background(), client, func(msg string) {
+		logs = append(logs, msg)
+	})
+	if err != nil {
+		t.Fatalf("compress history: %v", err)
+	}
+	if callCount != 3 {
+		t.Fatalf("expected 3 compression attempts, got %d", callCount)
+	}
+	if session.state.RollingSummary != "retried summary" {
+		t.Fatalf("expected retried summary to persist, got %q", session.state.RollingSummary)
+	}
+
+	retryLogs := 0
+	for _, line := range logs {
+		if strings.Contains(line, "Increasing request timeout to") {
+			retryLogs++
+		}
+	}
+	if retryLogs != 2 {
+		t.Fatalf("expected 2 timeout-growth logs, got %d (%v)", retryLogs, logs)
+	}
+}
+
+func TestCompressHistoryFallsBackAfterRetryExhaustion(t *testing.T) {
+	useTestScannerConfig(t)
+	useTestAIRequestPolicy(t, 3)
+	config.AI = config.AIConfig{Model: "gpt-4o-mini"}
+
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if err := session.appendSynthetic(openai.ChatMessageRoleAssistant, runtimeKindNormal, "finding-1", nil); err != nil {
+		t.Fatalf("append finding-1: %v", err)
+	}
+	if err := session.appendSynthetic(openai.ChatMessageRoleUser, runtimeKindNormal, "finding-2", nil); err != nil {
+		t.Fatalf("append finding-2: %v", err)
+	}
+
+	callCount := 0
+	logs := []string{}
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		return nil, new524Error()
+	}))
+
+	err = session.compressHistory(context.Background(), client, func(msg string) {
+		logs = append(logs, msg)
+	})
+	if err != nil {
+		t.Fatalf("compress history: %v", err)
+	}
+	if callCount != 3 {
+		t.Fatalf("expected 3 compression attempts before fallback, got %d", callCount)
+	}
+	if !strings.Contains(session.state.RollingSummary, "Compression failed before a fresh summary could be produced.") {
+		t.Fatalf("expected fallback summary after retry exhaustion, got %q", session.state.RollingSummary)
+	}
+	if !strings.Contains(session.state.RollingSummary, "524") {
+		t.Fatalf("expected fallback summary to record final 524 error, got %q", session.state.RollingSummary)
+	}
+
+	foundFallbackLog := false
+	for _, line := range logs {
+		if strings.Contains(line, "Context compression failed; using fallback summary") {
+			foundFallbackLog = true
+			break
+		}
+	}
+	if !foundFallbackLog {
+		t.Fatalf("expected fallback log entry, got %v", logs)
 	}
 }
