@@ -471,6 +471,10 @@ func (a *chatCompletionStreamAccumulator) addChunk(chunk openai.ChatCompletionSt
 	}
 }
 
+func (a *chatCompletionStreamAccumulator) hasTerminalChoice() bool {
+	return a.choiceInitialized && a.choice.FinishReason != ""
+}
+
 func (a *chatCompletionStreamAccumulator) finalize() (openai.ChatCompletionResponse, error) {
 	if !a.choiceInitialized {
 		return openai.ChatCompletionResponse{}, errEmptyChatCompletionStream
@@ -547,6 +551,13 @@ func createChatCompletionStream(ctx context.Context, client *openai.Client, req 
 			break
 		}
 		if recvErr != nil {
+			if accumulator.hasTerminalChoice() && isAIRequestTimeout(recvErr) {
+				resp, finalizeErr := accumulator.finalize()
+				if finalizeErr == nil {
+					return resp, accumulator.receivedChunk, nil
+				}
+				return openai.ChatCompletionResponse{}, accumulator.receivedChunk, finalizeErr
+			}
 			return openai.ChatCompletionResponse{}, accumulator.receivedChunk, recvErr
 		}
 		accumulator.addChunk(chunk)
@@ -637,7 +648,8 @@ func createChatCompletionWithRetry(
 		if err == nil {
 			return resp, nil
 		}
-		if receivedChunk {
+		timeoutLike := isAIRequestTimeout(err)
+		if receivedChunk && !timeoutLike {
 			if hooks.onNonRetryable != nil {
 				hooks.onNonRetryable(attempt, attempts, attemptTimeout, err)
 			}
@@ -655,7 +667,6 @@ func createChatCompletionWithRetry(
 
 		retryDelay := time.Duration(attempt) * time.Second
 		nextTimeout := attemptTimeout
-		timeoutLike := isAIRequestTimeout(err)
 		if timeoutLike {
 			nextTimeout = clampAIRequestTimeout(attemptTimeout+timeoutStep, initialTimeout, maxTimeout)
 			currentTimeout = nextTimeout

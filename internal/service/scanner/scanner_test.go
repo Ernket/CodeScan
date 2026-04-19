@@ -696,6 +696,184 @@ func TestCreateChatCompletionWithRetryDoesNotRetryAfterPartialStreamError(t *tes
 	}
 }
 
+func TestCreateChatCompletionWithRetryAcceptsTerminalStreamTimeout(t *testing.T) {
+	useTestAIRequestPolicy(t, 3)
+
+	callCount := 0
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		return newChatCompletionStreamResponseWithTerminalError(t, context.DeadlineExceeded, openai.ChatCompletionStreamResponse{
+			ID:                "chatcmpl-stream-terminal",
+			Object:            "chat.completion.chunk",
+			Created:           123,
+			Model:             "gpt-4o-mini",
+			SystemFingerprint: "fp-test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "complete",
+					},
+					FinishReason: openai.FinishReasonStop,
+				},
+			},
+		}), nil
+	}))
+
+	resp, err := createChatCompletionWithRetry(context.Background(), client, openai.ChatCompletionRequest{
+		Model: "gpt-4o-mini",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}, chatCompletionRetryHooks{})
+	if err != nil {
+		t.Fatalf("create chat completion with terminal stream timeout: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected terminal stream timeout to finalize without retry, got %d calls", callCount)
+	}
+	if len(resp.Choices) != 1 {
+		t.Fatalf("expected one choice, got %d", len(resp.Choices))
+	}
+	if resp.Choices[0].Message.Content != "complete" {
+		t.Fatalf("expected finalized content, got %+v", resp.Choices[0].Message)
+	}
+	if resp.Choices[0].FinishReason != openai.FinishReasonStop {
+		t.Fatalf("expected stop finish reason, got %q", resp.Choices[0].FinishReason)
+	}
+}
+
+func TestCreateChatCompletionWithRetryAcceptsTerminalToolCallStreamTimeout(t *testing.T) {
+	useTestAIRequestPolicy(t, 3)
+
+	callCount := 0
+	firstToolIndex := 0
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		return newChatCompletionStreamResponseWithTerminalError(t, context.DeadlineExceeded,
+			openai.ChatCompletionStreamResponse{
+				ID:      "chatcmpl-stream-tool-timeout",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o-mini",
+				Choices: []openai.ChatCompletionStreamChoice{
+					{
+						Index: 0,
+						Delta: openai.ChatCompletionStreamChoiceDelta{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									Index: &firstToolIndex,
+									ID:    "call-1",
+									Type:  openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "read",
+										Arguments: "{\"path\"",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			openai.ChatCompletionStreamResponse{
+				Choices: []openai.ChatCompletionStreamChoice{
+					{
+						Index: 0,
+						Delta: openai.ChatCompletionStreamChoiceDelta{
+							ToolCalls: []openai.ToolCall{
+								{
+									Index: &firstToolIndex,
+									Function: openai.FunctionCall{
+										Name:      "_file",
+										Arguments: ":\"a.go\"}",
+									},
+								},
+							},
+						},
+						FinishReason: openai.FinishReasonToolCalls,
+					},
+				},
+			},
+		), nil
+	}))
+
+	resp, err := createChatCompletionWithRetry(context.Background(), client, openai.ChatCompletionRequest{
+		Model: "gpt-4o-mini",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}, chatCompletionRetryHooks{})
+	if err != nil {
+		t.Fatalf("create chat completion with terminal tool-call stream timeout: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected terminal tool-call stream timeout to finalize without retry, got %d calls", callCount)
+	}
+	if len(resp.Choices) != 1 {
+		t.Fatalf("expected one choice, got %d", len(resp.Choices))
+	}
+	if resp.Choices[0].FinishReason != openai.FinishReasonToolCalls {
+		t.Fatalf("expected tool_calls finish reason, got %q", resp.Choices[0].FinishReason)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected one merged tool call, got %+v", resp.Choices[0].Message.ToolCalls)
+	}
+	if resp.Choices[0].Message.ToolCalls[0].Function.Name != "read_file" {
+		t.Fatalf("expected merged tool name, got %q", resp.Choices[0].Message.ToolCalls[0].Function.Name)
+	}
+	if resp.Choices[0].Message.ToolCalls[0].Function.Arguments != "{\"path\":\"a.go\"}" {
+		t.Fatalf("expected merged tool arguments, got %q", resp.Choices[0].Message.ToolCalls[0].Function.Arguments)
+	}
+}
+
+func TestCreateChatCompletionWithRetryRetriesAfterPartialStreamTimeout(t *testing.T) {
+	useTestAIRequestPolicy(t, 3)
+
+	callCount := 0
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		if callCount == 1 {
+			return newChatCompletionStreamResponseWithTerminalError(t, context.DeadlineExceeded, openai.ChatCompletionStreamResponse{
+				ID:      "chatcmpl-stream-partial-timeout",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o-mini",
+				Choices: []openai.ChatCompletionStreamChoice{
+					{
+						Index: 0,
+						Delta: openai.ChatCompletionStreamChoiceDelta{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "partial",
+						},
+					},
+				},
+			}), nil
+		}
+		return newChatCompletionHTTPResponse(t, req, "recovered"), nil
+	}))
+
+	resp, err := createChatCompletionWithRetry(context.Background(), client, openai.ChatCompletionRequest{
+		Model: "gpt-4o-mini",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}, chatCompletionRetryHooks{})
+	if err != nil {
+		t.Fatalf("create chat completion after partial stream timeout retry: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected partial stream timeout to retry once, got %d calls", callCount)
+	}
+	if len(resp.Choices) != 1 {
+		t.Fatalf("expected one choice, got %d", len(resp.Choices))
+	}
+	if resp.Choices[0].Message.Content != "recovered" {
+		t.Fatalf("expected retry to recover a complete response, got %+v", resp.Choices[0].Message)
+	}
+}
+
 func TestRepairJSONRetriesTimeoutLikeErrors(t *testing.T) {
 	useTestAIRequestPolicy(t, 3)
 	config.AI = config.AIConfig{Model: "gpt-4o-mini"}

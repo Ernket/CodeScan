@@ -52,6 +52,27 @@ func (d testHTTPDoer) Do(req *http.Request) (*http.Response, error) {
 	return d(req)
 }
 
+type errAfterDataReadCloser struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterDataReadCloser) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	if r.err == nil {
+		return 0, io.EOF
+	}
+	return 0, r.err
+}
+
+func (r *errAfterDataReadCloser) Close() error {
+	return nil
+}
+
 func newTestAIClient(doer openai.HTTPDoer) *openai.Client {
 	cfg := openai.DefaultConfig("test-key")
 	cfg.BaseURL = "http://example.com/v1"
@@ -174,6 +195,33 @@ func newChatCompletionStreamResponse(t *testing.T, chunks ...openai.ChatCompleti
 		Status:     "200 OK",
 		Header:     header,
 		Body:       io.NopCloser(strings.NewReader(body.String())),
+	}
+}
+
+func newChatCompletionStreamResponseWithTerminalError(t *testing.T, err error, chunks ...openai.ChatCompletionStreamResponse) *http.Response {
+	t.Helper()
+
+	var body strings.Builder
+	for _, chunk := range chunks {
+		data, marshalErr := json.Marshal(chunk)
+		if marshalErr != nil {
+			t.Fatalf("marshal chat completion stream response: %v", marshalErr)
+		}
+		body.WriteString("data: ")
+		body.Write(data)
+		body.WriteString("\n\n")
+	}
+
+	header := make(http.Header)
+	header.Set("Content-Type", "text/event-stream")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     header,
+		Body: &errAfterDataReadCloser{
+			data: []byte(body.String()),
+			err:  err,
+		},
 	}
 }
 
