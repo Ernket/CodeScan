@@ -1,0 +1,3351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ywljsec - CodeScan 审计报告</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --paper: #ffffff;
+      --ink: #0f172a;
+      --muted: #475569;
+      --line: #dbe4f0;
+      --soft: #eef4fb;
+      --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+      --radius: 22px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top left, rgba(59,130,246,0.10), transparent 32%), linear-gradient(180deg, #fbfdff 0%, var(--bg) 100%);
+      color: var(--ink);
+      line-height: 1.6;
+    }
+    .page { max-width: 1240px; margin: 0 auto; padding: 32px; }
+    .hero, .summary-card, .stage-shell, .finding-card, .meta-card { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(135deg, #ffffff 0%, #f6f9ff 62%, #edf4ff 100%);
+      padding: 32px;
+      margin-bottom: 24px;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -80px -100px auto;
+      width: 240px;
+      height: 240px;
+      background: radial-gradient(circle, rgba(59,130,246,0.18), transparent 70%);
+    }
+    .eyebrow, .meta-label, .section-eyebrow, .field-label, .stat-label {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #2563eb;
+      background: rgba(37,99,235,0.08);
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(37,99,235,0.14);
+    }
+    h1 { margin: 18px 0 10px; font-size: 36px; line-height: 1.15; }
+    .hero-grid { display: grid; grid-template-columns: 1.45fr 0.9fr; gap: 24px; align-items: start; }
+    .meta-grid, .summary-grid, .stage-summary, .finding-grid { display: grid; gap: 14px; }
+    .meta-grid, .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .meta-card, .summary-card { padding: 18px 20px; }
+    .meta-label, .section-eyebrow, .field-label, .stat-label { color: #64748b; margin-bottom: 6px; }
+    .meta-value, .stat-value { color: var(--ink); font-weight: 600; word-break: break-word; }
+    .stat-value strong { font-size: 28px; color: #0f172a; }
+    .pill-row, .severity-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .pill-row { margin-top: 18px; }
+    .stage-pill, .severity-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .stage-pill {
+      color: var(--ink);
+      border: 1px solid color-mix(in srgb, var(--accent) 22%, white);
+      background: color-mix(in srgb, var(--accent) 8%, white);
+    }
+    section { margin-top: 28px; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .section-title h2 { margin: 0; font-size: 24px; }
+    .stage-shell { overflow: hidden; margin-bottom: 20px; border-left: 8px solid var(--accent); }
+    .stage-head {
+      padding: 22px 24px 18px;
+      background: linear-gradient(140deg, color-mix(in srgb, var(--accent) 10%, white), white 58%);
+      border-bottom: 1px solid var(--line);
+    }
+    .stage-head-top { display: flex; justify-content: space-between; align-items: start; gap: 14px; }
+    .stage-title { margin: 0; font-size: 22px; }
+    .stage-description, .finding-desc { color: var(--muted); font-size: 14px; }
+    .stage-description { margin: 8px 0 0; }
+    .finding-desc { margin: 0; }
+    .stage-summary { margin-top: 16px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .stage-stat {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.70);
+      border: 1px solid rgba(148,163,184,0.18);
+    }
+    .stage-stat strong { display: block; font-size: 22px; margin-top: 4px; color: var(--ink); }
+    .stage-body { padding: 22px 24px 26px; }
+    .state-note {
+      padding: 18px 20px;
+      border-radius: 18px;
+      border: 1px dashed #94a3b8;
+      background: #f8fbff;
+      color: #334155;
+    }
+    .finding-card { padding: 18px 18px 20px; margin-top: 14px; }
+    .finding-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+    .finding-title { margin: 8px 0 6px; font-size: 19px; }
+    .finding-grid { margin-top: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .field-card { background: var(--soft); border: 1px solid var(--line); border-radius: 16px; padding: 14px; }
+    .field-card pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #0f172a;
+      font-family: "Cascadia Code", "Consolas", monospace;
+    }
+    .field-value { font-size: 14px; color: #0f172a; word-break: break-word; }
+    .footer { margin-top: 28px; color: #64748b; text-align: center; font-size: 12px; }
+    @media (max-width: 980px) {
+      .page { padding: 20px; }
+      .hero-grid, .summary-grid, .meta-grid, .stage-summary, .finding-grid { grid-template-columns: 1fr; }
+    }
+    @media print {
+      body { background: white; }
+      .page { max-width: none; padding: 0; }
+      .hero, .summary-card, .stage-shell, .finding-card, .meta-card { box-shadow: none; }
+      section, .stage-shell, .finding-card { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow">CodeScan 审计报告</div>
+      <div class="hero-grid">
+        <div>
+          <h1>ywljsec</h1>
+          <p style="margin:0;color:#475569;font-size:15px;">任务级导出报告，自动汇总当前任务中已完成的审计阶段，并整理关键风险、影响范围与证据片段。</p>
+          <div class="pill-row">
+            
+              <span class="stage-pill" style="--accent: #ef4444;">RCE 审计</span>
+            
+              <span class="stage-pill" style="--accent: #f59e0b;">注入审计</span>
+            
+              <span class="stage-pill" style="--accent: #0ea5e9;">认证与会话审计</span>
+            
+              <span class="stage-pill" style="--accent: #6366f1;">访问控制审计</span>
+            
+              <span class="stage-pill" style="--accent: #06b6d4;">配置与组件审计</span>
+            
+              <span class="stage-pill" style="--accent: #f97316;">文件操作审计</span>
+            
+              <span class="stage-pill" style="--accent: #f43f5e;">业务逻辑审计</span>
+            
+          </div>
+        </div>
+        <div class="meta-grid">
+          <div class="meta-card">
+            <div class="meta-label">任务 ID</div>
+            <div class="meta-value">93ef76b3cfbe4277814d00215db4ac65</div>
+          </div>
+          <div class="meta-card">
+            <div class="meta-label">创建时间</div>
+            <div class="meta-value">2026-04-17 22:50:11</div>
+          </div>
+          <div class="meta-card">
+            <div class="meta-label">导出时间</div>
+            <div class="meta-value">2026-04-19 11:57:51</div>
+          </div>
+          <div class="meta-card">
+            <div class="meta-label">纳入阶段</div>
+            <div class="meta-value">7</div>
+          </div>
+          
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <div>
+          <div class="section-eyebrow">概要</div>
+          <h2>整体概览</h2>
+        </div>
+        <div class="severity-row">
+          
+            <span class="severity-chip" style="ZgotmplZ">严重 · 8</span>
+          
+            <span class="severity-chip" style="ZgotmplZ">高危 · 10</span>
+          
+            <span class="severity-chip" style="ZgotmplZ">中危 · 3</span>
+          
+        </div>
+      </div>
+      <div class="summary-grid">
+        <div class="summary-card">
+          <div class="stat-label">已完成审计</div>
+          <div class="stat-value"><strong>7</strong> 个阶段</div>
+        </div>
+        <div class="summary-card">
+          <div class="stat-label">已确认发现</div>
+          <div class="stat-value"><strong>21</strong> 条</div>
+        </div>
+        <div class="summary-card">
+          <div class="stat-label">唯一源码位置</div>
+          <div class="stat-value"><strong>20</strong> 个文件</div>
+        </div>
+        <div class="summary-card">
+          <div class="stat-label">接口覆盖面</div>
+          <div class="stat-value"><strong>8</strong> 个路由或端点</div>
+        </div>
+        <div class="summary-card">
+          <div class="stat-label">路由清单</div>
+          <div class="stat-value"><strong>8</strong> 条已扫描路由</div>
+        </div>
+        <div class="summary-card">
+          <div class="stat-label">零发现阶段</div>
+          <div class="stat-value"><strong>3</strong> 个阶段</div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <div>
+          <div class="section-eyebrow">模块</div>
+          <h2>已纳入导出的审计阶段</h2>
+        </div>
+      </div>
+
+      
+      <article class="stage-shell" style="--accent: #ef4444;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">RCE 审计</h3>
+              <p class="stage-description">远程代码执行深度审计</p>
+            </div>
+            <div class="severity-row">
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-19 10:42:19</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">该阶段已完成，未发现已确认漏洞。</p>
+
+          
+            <div class="state-note">该阶段已执行完成，未发现已确认漏洞。本结果会保留在导出报告中，便于后续追踪与留档。</div>
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #f59e0b;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">注入审计</h3>
+              <p class="stage-description">SQL 注入与命令注入深度审计</p>
+            </div>
+            <div class="severity-row">
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-18 09:24:35</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">该阶段已完成，未发现已确认漏洞。</p>
+
+          
+            <div class="state-note">该阶段已执行完成，未发现已确认漏洞。本结果会保留在导出报告中，便于后续追踪与留档。</div>
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #0ea5e9;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">认证与会话审计</h3>
+              <p class="stage-description">认证流程与会话管理审计</p>
+            </div>
+            <div class="severity-row">
+              
+                <span class="severity-chip" style="ZgotmplZ">严重 · 3</span>
+              
+                <span class="severity-chip" style="ZgotmplZ">高危 · 2</span>
+              
+                <span class="severity-chip" style="ZgotmplZ">中危 · 1</span>
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>6</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>6</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>5</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-18 09:18:28</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">本报告纳入 6 条发现。</p>
+
+          
+            
+              <article class="finding-card" id="auth-1">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">中危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Weak Password Policy</h4>
+                    <p class="finding-desc">注册接口直接接收并保存用户提交的 password，没有任何最小长度、复杂度或弱口令校验，导致攻击者可以注册极弱密码账户。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 register() 中确认：GET 参数 password 被直接读取，并在 attack_type=&#39;arbitrarily&#39; 与 &#39;cover&#39; 分支中直接传入 userinfo.objects.create(..., password=password)。代码中未见任何长度、复杂度、弱口令或 Django 密码校验逻辑，结论成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:249</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /register/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：password</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:249</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">注册口令</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /register/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>register() 从 GET 参数读取 password 后，在 attack_type=&#39;arbitrarily&#39; 与 attack_type=&#39;cover&#39; 分支中直接调用 userinfo.objects.create(..., password=password) 保存。代码未调用 Django 内置密码校验器，也未执行长度、字符种类或常见弱口令检查。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>password = request.GET.get(&#34;password&#34;)
+...
+userinfo.objects.create(
+    username=username,
+    phone=phone,
+    password=password,
+)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /register/?attack_type=cover&amp;username=testuser&amp;phone=13800138000&amp;password=1 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 向注册接口提交极短弱密码，例如 1 或 123。2. 观察接口返回“用户成功注册！！”或创建成功。3. 说明系统未对注册口令实施有效安全策略。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可批量创建弱口令账户，显著降低账户被猜解、撞库或后续接管的成本。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="auth-2">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Unauthorized Access</h4>
+                    <p class="finding-desc">该接口完全没有登录态、会话、令牌或身份校验，匿名请求即可读取所有用户数据，并可直接修改、删除用户记录。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 unauthorized_access() 中确认：函数仅根据 GET 参数 username、role、operation、password 等执行查询、编辑、删除、提权操作，未见任何 request.user、session、token、装饰器或权限判断。username 为空时还会返回全部用户数据，未授权访问与未授权修改/删除均可直接触发。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:28</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /unauthorized_access/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:28</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">无认证机制，直接通过查询参数执行业务操作</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /unauthorized_access/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>unauthorized_access() 仅依据 GET 参数 username、role、operation 决定执行查询、编辑、删除、角色提升等操作，整个函数中没有 request.user、session、token 或任何鉴权分支。username 为空时还会直接返回全部用户数据。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>if username ==None:
+    results = userinfo.objects.all().values(&#39;username&#39;,&#39;password&#39;,&#39;name&#39;,&#39;phone&#39;,&#39;address&#39;,&#39;roles&#39;)
+...
+elif operation ==&#39;edit&#39;:
+    rs = userinfo.objects.get(username=username)
+    if password!=None:
+        rs.password=password
+    ...
+    rs.save()
+...
+elif operation==&#39;del&#39;:
+    userinfo.objects.get(username=username).delete()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /unauthorized_access/?username=victim&amp;operation=edit&amp;password=hacked123 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 在未登录、无任何 Cookie 或 Authorization 头的情况下直接访问接口。2. 发送带 operation=edit 或 operation=del 的请求。3. 观察接口直接返回成功信息，说明敏感操作可被匿名触发。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者无需认证即可读取敏感账户资料、重置他人密码或删除账户，造成全面身份体系失守。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="auth-3">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Unauthorized Access</h4>
+                    <p class="finding-desc">购物接口没有任何登录校验，服务端直接信任查询参数 username 作为当前用户身份，匿名请求即可代表任意用户发起购买并扣减其余额。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 shopping() 中确认：GET 与 POST 均从 request.GET.get(&#34;username&#34;) 获取身份，POST 分支直接按该用户名读取 userinfo 并扣减 money、更新商品库存。代码中未见登录态、session、token 或用户绑定校验，因此匿名请求可冒充任意用户购买。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:120</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:120</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">无认证机制，使用 URL 参数 username 代表购买身份</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /shopping/
+POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>shopping() 在 GET/POST 分支都通过 request.GET.get(&#34;username&#34;) 取得用户名；POST 分支随后执行 userinfo.objects.get(username=username) 并修改该用户 money 字段，全程不存在会话校验或身份绑定。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>username = request.GET.get(&#34;username&#34;)
+...
+userrs = userinfo.objects.get(username=username)
+money = userrs.money
+...
+userrs.money = money-total
+userrs.save()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=victim HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+Connection: close
+Content-Length: 31
+
+name=DemoItem&amp;price=1&amp;num=1</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 不携带任何登录态直接向购物接口发送 POST 请求。2. 在 URL 中指定任意存在的 username。3. 观察接口返回“购买成功！！！”，且目标用户余额被扣减。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可匿名冒充任意用户执行交易类操作，导致账户资金和业务状态被未认证请求篡改。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="auth-4">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Unauthorized Access</h4>
+                    <p class="finding-desc">短信验证码校验流程存在可直接绕过的逻辑：当 attack_type=noauth 且未提交 code 参数时，接口直接返回“短信验证码校验成功”；当 attack_type=constant 时，固定验证码 888888 对任意请求生效。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 msg_code() 中确认：attack_type=&#39;noauth&#39; 时若 rcode==None 会直接返回“短信验证码校验成功”；attack_type=&#39;constant&#39; 时只要 rcode==&#39;888888&#39; 即返回成功。这两条代码路径均可在无真实验证码的情况下通过验证，绕过结论明确。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:219</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /msg_code/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：attack_type</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:219</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">短信验证码校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /msg_code/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>msg_code() 的 noauth 分支中，rcode==None 时立即返回成功，根本不校验缓存中的真实验证码；constant 分支则把字符串 &#39;888888&#39; 作为通用通过条件。两种路径都使验证码验证失去身份证明作用。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif attack_type==&#39;noauth&#39;:
+    code = cache.get(f&#39;phone_{phone}&#39;)
+    try:
+        if rcode==None:
+            return JsonResponse({&#34;msg&#34;: &#34;短信验证码校验成功&#34;, &#34;code&#34;: 200})
+...
+elif attack_type == &#39;constant&#39;:
+    if rcode == &#39;888888&#39;:
+        return JsonResponse({&#34;msg&#34;: &#34;短信验证码校验成功&#34;, &#34;code&#34;: 200})</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /msg_code/?phone=13800138000&amp;attack_type=noauth HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 直接请求短信验证码校验接口并设置 attack_type=noauth，且不传 code。2. 观察接口返回“短信验证码校验成功”。3. 也可发送 attack_type=constant&amp;code=888888，请求同样会被接受。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可在无需真实短信验证码的情况下通过验证步骤，从而绕过基于短信验证码的身份确认流程。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="auth-5">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Brute Force</h4>
+                    <p class="finding-desc">短信验证码校验接口没有任何失败计数、锁定、延时、频率限制或挑战机制，允许对验证码进行无限次猜测。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 msg_code() 中确认：attack_type=&#39;nofail&#39; 分支仅做 int(rcode)==int(code) 比较，失败时直接返回错误，未记录失败次数、未锁定、未延时、未使验证码失效，也未见频率控制逻辑。代码层面支持可重复尝试的暴力猜测结论。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:209</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /msg_code/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：code</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:209</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">短信验证码校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /msg_code/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>msg_code() 的 nofail 分支仅从缓存读取验证码后执行 if int(rcode)==int(code) 比较，错误时直接返回“校验错误”，但不会记录尝试次数、不会使验证码失效，也不会对来源进行限制，因此可被持续爆破。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif attack_type==&#39;nofail&#39;:
+    code = cache.get(f&#39;phone_{phone}&#39;)
+    try:
+        if int(rcode)==int(code):
+            return JsonResponse({&#34;msg&#34;:&#34;短信验证码校验成功&#34;,&#34;code&#34;:200})
+        else:
+            return JsonResponse({&#34;msg&#34;:&#34;校验错误&#34;,&#34;code&#34;:0,&#34;real_code&#34;:code})</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /msg_code/?phone=13800138000&amp;attack_type=nofail&amp;code=000000 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 先为某手机号触发一次验证码发送，使缓存中存在验证码。2. 对 nofail 校验接口持续发送不同 code 值的请求。3. 观察接口始终可继续尝试，直到猜中为止，过程中无锁定、无延迟、无失败上限。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可以对短信验证码进行自动化穷举，削弱验证码作为身份校验因子的安全性。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="auth-6">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">补扫结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Unauthorized Access</h4>
+                    <p class="finding-desc">初始化接口对外暴露且完全缺少认证检查，任意匿名访问都能删除现有用户与商品数据并重新生成测试数据。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/ywljsec/urls.py 中确认 /init_data/ 直接映射到 init_data()；并在 ywljsec-master/apps/views.py 中确认该函数对 GET 请求直接执行 userinfo.objects.all().delete() 与 commodityinfo.objects.all().delete() 后重建数据，未见任何认证、会话、令牌或管理员权限检查。匿名触发高危数据重置成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:159</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /init_data/</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:159</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证机制</div>
+                      
+                        <div class="field-value">无认证机制，匿名触发数据初始化</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /init_data/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>urls.py 将 /init_data/ 直接路由到 init_data()。init_data() 在 GET 请求中直接执行 userinfo.objects.all().delete() 与 commodityinfo.objects.all().delete()，随后批量创建新用户和商品。整个过程没有 request.user、session、token、管理员校验或任何口令确认，因此未登录用户即可触发对身份数据的重置。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>def init_data(request):
+    if request.method == &#39;GET&#39;:
+        ...
+        userinfo.objects.all().delete()
+        ...
+        commodityinfo.objects.all().delete()
+        ...
+        return HttpResponse(&#34;初始化成功&#34;)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /init_data/ HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 在未登录、无任何 Cookie 或 Authorization 头的情况下直接请求初始化接口。2. 观察接口返回“初始化成功”。3. 随后检查用户与商品数据已被删除并重建，说明高危身份相关操作可被匿名触发。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可在未认证状态下重置整站用户数据与商品数据，导致账户体系被破坏、原有身份资料丢失，并可迫使系统进入攻击者可预期的测试数据状态。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+            
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #6366f1;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">访问控制审计</h3>
+              <p class="stage-description">授权与访问边界审计</p>
+            </div>
+            <div class="severity-row">
+              
+                <span class="severity-chip" style="ZgotmplZ">严重 · 5</span>
+              
+                <span class="severity-chip" style="ZgotmplZ">高危 · 1</span>
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>6</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>6</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>3</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-18 01:52:29</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">本报告纳入 6 条发现。</p>
+
+          
+            
+              <article class="finding-card" id="access-1">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Missing Function-Level Access Control</h4>
+                    <p class="finding-desc">未登录攻击者可以直接读取所有用户与管理员的敏感信息，属于缺失函数级访问控制。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>在 views.py 的 unauthorized_access 中，GET 请求下当 username 为 None 时直接执行 userinfo.objects.all().values(&#39;username&#39;,&#39;password&#39;,&#39;name&#39;,&#39;phone&#39;,&#39;address&#39;,&#39;roles&#39;) 并返回 JsonResponse。代码中不存在任何认证、会话、角色或权限判断，路由 /unauthorized_access/ 也被直接公开注册，因此该匿名读取全量用户资料的路径可被代码直接证实。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:37</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /unauthorized_access/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:37</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">仅管理员或具备用户管理权限的人员才能查看全量用户资料</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">敏感管理功能边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">全部站内用户与管理员</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">userinfo 全量用户资料列表（含密码、手机号、地址、角色）</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /unauthorized_access/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>当 username 为空时，代码直接执行 userinfo.objects.all().values(...) 并返回全部用户资料，没有任何登录校验、角色校验或最小权限限制。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>直接匿名访问管理型接口，不传任何参数即可获取全站用户数据。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>请求进入 unauthorized_access 后，if username == None 分支直接查询并返回全部账号记录，未依赖会话、令牌、角色或来源校验。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>if username ==None:
+    results = userinfo.objects.all().values(&#39;username&#39;,&#39;password&#39;,&#39;name&#39;,&#39;phone&#39;,&#39;address&#39;,&#39;roles&#39;)
+    ...
+    return JsonResponse(rs,safe=False)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /unauthorized_access/ HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 以未登录状态访问 /unauthorized_access/。2. 不提供 username 参数。3. 观察响应中直接返回全部用户的账号、密码、手机号、地址与角色信息。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可匿名枚举全站账户和敏感资料，为后续账户接管、社工、定向攻击和权限滥用提供基础数据。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="access-2">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Horizontal Privilege Escalation</h4>
+                    <p class="finding-desc">接口把 username 当成唯一授权依据，攻击者只需替换标识符即可越权操作其他普通用户数据，形成典型 IDOR/水平越权。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>在 unauthorized_access 的 role==None 分支中，只要提供 username 即可进入查看、edit、del 逻辑。查看时按 username 查询普通用户资料，编辑时直接 get(username=username) 并修改 password/phone/address，删除时直接 delete()。整个流程没有任何登录态、当前用户归属或所有权比对，因此用他人 username 进行水平越权在代码中明确成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:53</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /unauthorized_access/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:53</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">目标用户本人</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">资源所有权边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户或任意普通用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">另一名普通用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">指定 username 对应的普通用户资料与账户记录</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /unauthorized_access/?username=:username
+GET /unauthorized_access/?username=:username&amp;operation=edit
+GET /unauthorized_access/?username=:username&amp;operation=del</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>当 role 为空且提供 username 时，代码直接按 username 查询、修改或删除 userinfo 记录，没有任何“当前用户是否就是该 username”的归属校验，也没有认证检查。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>将 username 改为其他普通用户的用户名，即可查看、篡改或删除对方账户。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>读取分支使用 filter(username=username) 返回目标资料；编辑分支使用 userinfo.objects.get(username=username) 后直接更新 password/phone/address；删除分支直接 delete()。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif len(username)&gt;0 and role==None:
+    if operation==None:
+        results = userinfo.objects.filter(roles=&#39;普通用户&#39;).filter(username=username)...
+    elif operation ==&#39;edit&#39;:
+        rs = userinfo.objects.get(username=username)
+        ...
+        rs.save()
+    elif operation==&#39;del&#39;:
+        userinfo.objects.get(username=username).delete()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /unauthorized_access/?username=victim_user&amp;operation=edit&amp;password=hacked123&amp;phone=13800000000&amp;address=%E6%94%BB%E5%87%BB%E8%80%85%E5%9C%B0%E5%9D%80 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 获取或猜测另一名普通用户的 username。2. 以未登录状态请求 /unauthorized_access/?username=目标用户名 查看资料，或追加 operation=edit/del 执行修改或删除。3. 观察目标记录被读取、篡改或移除。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可读取其他用户敏感信息、修改其密码与联系方式，甚至直接删除账号，造成账户接管和业务数据破坏。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="access-3">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Vertical Privilege Escalation</h4>
+                    <p class="finding-desc">低权限甚至未登录用户可直接跨越角色边界，对管理员资料执行查看、修改、删除操作，属于严重垂直越权。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>在 unauthorized_access 的 role!=None 分支中，查看逻辑按 roles=role 和 username 查询，编辑逻辑直接 get(username=username) 后可修改 password/phone/address 并写入 rs.roles=role，删除逻辑也直接按 username 删除。代码没有任何请求者角色验证，因此攻击者自行传入 role=管理员 和管理员用户名即可跨角色读取、修改或删除管理员账户，垂直越权成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:73</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /unauthorized_access/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：role</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:73</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">管理员或具备高权限用户管理能力的角色</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">角色边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户或低权限普通用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">管理员账户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">管理员账号资料与管理员账户本身</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /unauthorized_access/?username=:admin&amp;role=管理员
+GET /unauthorized_access/?username=:admin&amp;role=管理员&amp;operation=edit
+GET /unauthorized_access/?username=:admin&amp;role=管理员&amp;operation=del</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>当传入 role 时，代码仅按 username 和 role 查询或直接按 username 取记录进行修改/删除，从未验证请求者是否具备管理员权限。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>在请求中自行添加 role=管理员，并指定管理员 username，即可读取、修改或删除管理员账户。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>查看分支使用 filter(roles=role).filter(username=username)；编辑分支直接取目标用户并把 rs.roles=role 后保存；删除分支按 username 直接 delete()。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif len(username)&gt;0 and role!=None:
+    if operation == None:
+        results = userinfo.objects.filter(roles=role).filter(username=username)...
+    elif operation ==&#39;edit&#39;:
+        rs = userinfo.objects.get(username=username)
+        ...
+        rs.roles=role
+        rs.save()
+    elif operation==&#39;del&#39;:
+        userinfo.objects.get(username=username).delete()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /unauthorized_access/?username=admin_user&amp;role=%E7%AE%A1%E7%90%86%E5%91%98&amp;operation=edit&amp;password=AdminReset123&amp;phone=13900000000&amp;address=%E8%A2%AB%E7%AF%A1%E6%94%B9 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 获取管理员 username。2. 以未登录状态访问 /unauthorized_access/?username=管理员&amp;role=管理员 查看管理员资料。3. 使用 operation=edit 或 operation=del 再次请求。4. 观察管理员资料被修改或账号被删除。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可直接操控管理员账户，导致后台权限体系失效，并可进一步控制更高价值业务功能。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="access-4">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Privilege Escalation</h4>
+                    <p class="finding-desc">接口允许调用方直接写入授权敏感字段 roles，形成明确的自助提权路径。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>在 unauthorized_access 中，operation==&#39;promotion&#39; 分支直接执行 userinfo.objects.get(username=username)，随后将 users.roles = role 并保存。该逻辑没有认证、权限校验、审批流程或限制目标用户必须由管理员操作，因此请求方可直接指定自己的 username 与 role=管理员 完成自助提权，证据充分。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:109</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /unauthorized_access/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：operation</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:109</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">仅管理员或专门的角色管理者可变更账号角色</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">角色管理边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户或低权限普通用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">管理员角色</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">userinfo.roles 权限字段</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /unauthorized_access/?username=:user&amp;operation=promotion&amp;role=管理员</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>promotion 分支直接根据 username 取出用户，并将 users.roles = role 后保存，没有任何认证、审批、当前角色校验或禁止自提权限制。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>攻击者将 username 指向自己并传入 role=管理员，即可把自己的角色升级为管理员。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>请求命中 operation == &#39;promotion&#39; 后，代码执行 users = userinfo.objects.get(username=username); users.roles = role; users.save()，完全缺乏授权控制。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif operation ==&#39;promotion&#39;:
+    users = userinfo.objects.get(username=username)
+    users.roles = role
+    users.save()
+    return JsonResponse({&#34;msg&#34;: &#34;更新成功：&#34;&#43;username})</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /unauthorized_access/?username=attacker_user&amp;operation=promotion&amp;role=%E7%AE%A1%E7%90%86%E5%91%98 HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 选择一个普通用户账号作为攻击者账号。2. 以未登录或低权限状态请求 /unauthorized_access/?username=该账号&amp;operation=promotion&amp;role=管理员。3. 再次查询该账号资料，观察 roles 已变为管理员。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可直接获得管理员身份，随后能够访问和操控所有更高权限功能，造成完整权限体系失守。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="access-5">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Horizontal Privilege Escalation</h4>
+                    <p class="finding-desc">攻击者可以冒用任意用户身份执行购物扣款，属于通过可控标识符访问他人资源的水平越权。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>shopping 的 GET 分支通过 request.GET.get(&#39;username&#39;) 直接读取 userinfo.objects.get(username=username).money，并渲染 shop.html；POST 分支继续从同一查询参数获取 username，再直接对该用户余额执行扣减并保存。代码中没有任何登录、会话绑定或“当前用户是否拥有该账户”的校验，因此替换 username 即可查看并消费他人余额，水平越权成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:123</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:123</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">目标账户本人才能消费自己的余额</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">资源所有权边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户或任意普通用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">另一名用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">目标用户账户余额 money 与购物操作</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /shopping/?username=:username
+POST /shopping/?username=:username</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>购物页面和购买提交都直接信任查询参数 username。GET 分支按 username 读取余额并渲染页面，POST 分支按 username 扣减该用户余额；整个过程没有登录身份、会话绑定或所有权校验。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>把请求中的 username 改为受害者用户名，即可查看其余额并让系统从受害者账户扣款。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>GET 分支通过 userinfo.objects.get(username=username).money 读取目标余额；POST 分支再次用同一 username 获取用户对象并执行 userrs.money = money-total; userrs.save()。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>username = request.GET.get(&#34;username&#34;)
+...
+money = userinfo.objects.get(username=username).money
+...
+userrs = userinfo.objects.get(username=username)
+...
+userrs.money = money-total
+userrs.save()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=victim_user HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+Connection: close
+
+name=ItemA&amp;price=10&amp;num=1</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 先访问 /shopping/?username=受害者用户名 确认页面可正常展示受害者余额。2. 构造 POST /shopping/?username=受害者用户名。3. 提交 name、price、num。4. 观察系统提示购买成功，且实际扣减的是受害者账户余额。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可越权消费他人账户资金并窥探他人余额信息，导致直接经济损失和账户数据被滥用。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="access-6">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">严重</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Missing Function-Level Access Control</h4>
+                    <p class="finding-desc">该接口属于高危运维/管理功能，但被公开暴露给任何请求者，形成严重的函数级访问控制缺失。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>views.py 中的 init_data 在处理 GET 请求时直接执行 userinfo.objects.all().delete() 与 commodityinfo.objects.all().delete()，随后重建测试数据并返回“初始化成功”。urls.py 将 /init_data/ 公开映射到该函数，代码中不存在认证、角色、环境开关或二次确认机制，因此匿名调用即可触发高危数据重置，结论明确。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:159</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /init_data/</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:159</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">认证状态</div>
+                      
+                        <div class="field-value">Unauthenticated</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">所需权限</div>
+                      
+                        <div class="field-value">仅管理员或维护人员才能执行数据初始化</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">访问边界</div>
+                      
+                        <div class="field-value">敏感运维功能边界</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">攻击者画像</div>
+                      
+                        <div class="field-value">游客用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标画像</div>
+                      
+                        <div class="field-value">系统管理员与全部业务用户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">目标资源</div>
+                      
+                        <div class="field-value">userinfo 与 commodityinfo 全部数据</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /init_data/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">授权逻辑</div>
+                      
+                        <pre>init_data 直接删除全部用户和商品数据并重新生成测试数据，没有任何认证、角色校验、环境限制或运维保护措施。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>匿名访问初始化接口即可执行全量数据重建。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>处理 GET 请求时，代码先执行 userinfo.objects.all().delete() 与 commodityinfo.objects.all().delete()，随后批量创建新数据并返回“初始化成功”。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>def init_data(request):
+    if request.method == &#39;GET&#39;:
+        userinfo.objects.all().delete()
+        ...
+        commodityinfo.objects.all().delete()
+        ...
+        return HttpResponse(&#34;初始化成功&#34;)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /init_data/ HTTP/1.1
+Host: target
+Connection: close</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 以未登录状态访问 /init_data/。2. 观察接口返回“初始化成功”。3. 再访问用户或商品相关页面，确认原始数据已被删除并替换为新生成数据。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可匿名重置核心业务数据，造成大规模数据破坏、账户失效、测试数据污染与业务不可用。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+            
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #06b6d4;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">配置与组件审计</h3>
+              <p class="stage-description">配置暴露与依赖组件风险审计</p>
+            </div>
+            <div class="severity-row">
+              
+                <span class="severity-chip" style="ZgotmplZ">高危 · 2</span>
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>2</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>2</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>1</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-18 01:36:00</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">本报告纳入 2 条发现。</p>
+
+          
+            
+              <article class="finding-card" id="config-1">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Sensitive Information Exposure</h4>
+                    <p class="finding-desc">应用在配置文件中提交了明文 Django SECRET_KEY，属于框架根密钥泄露。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/ywljsec/settings.py 中确认存在硬编码明文 SECRET_KEY，且未见通过环境变量或密钥管理覆盖注入的逻辑。该配置会随源码分发，足以支持“框架根密钥泄露”的静态结论。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/ywljsec/settings.py:23</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/ywljsec/settings.py:23</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">Static</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">配置项</div>
+                      
+                        <div class="field-value">SECRET_KEY</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>ANY /admin/
+POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">暴露机制</div>
+                      
+                        <pre>项目将 Django 的全局 SECRET_KEY 直接硬编码在仓库中。该密钥是 Django 框架用于签名安全相关数据的根密钥，一旦代码库、镜像或部署文件泄露，攻击者即可离线复用该密钥伪造依赖 Django signing 机制的数据，破坏框架级完整性保护。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">升级建议</div>
+                      
+                        <pre>将 SECRET_KEY 移出代码仓库，改为通过环境变量或专用密钥管理服务注入；立即轮换当前已泄露密钥；为不同环境使用不同密钥，并避免在示例仓库、镜像或文档中提交真实密钥。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>settings.py 在启动时直接加载硬编码的 SECRET_KEY。Django 使用该值参与多类签名与安全令牌计算；因此该项目所有依赖 Django 安全签名能力的功能都建立在一个已暴露的静态密钥之上。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码 / 配置</div>
+                      
+                        <pre>SECRET_KEY = &#39;django-insecure-p6*argwvuhp@-t)s!m@q57b^qc&#43;p*-ve8bjd6h6fi_i%chbj!y&#39;</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">复现步骤</div>
+                      
+                        <pre>1. 打开 ywljsec-master/ywljsec/settings.py。2. 观察第 23 行存在明文 SECRET_KEY。3. 确认该值未通过环境变量或密钥管理服务注入，而是随源码固定分发。4. 评估所有依赖 Django signing 的功能均受该泄露密钥影响，并应立即视为已失陷密钥进行轮换。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>一旦仓库或部署产物被获取，攻击者可利用泄露的框架根密钥破坏 Django 安全签名边界，导致依赖该密钥的签名数据、令牌或框架级安全机制失去可信性。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="config-2">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Debug Mode Enabled</h4>
+                    <p class="finding-desc">生产可达配置中启用了 DEBUG=True，且存在可由外部请求触发的未捕获异常路径，导致详细调试信息可被远程获取。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/ywljsec/settings.py 中确认 DEBUG = True；同时 ywljsec-master/apps/views.py 的 shopping POST 分支直接调用 userinfo.objects.get(username=username) 与 commodityinfo.objects.get(name=name) 且无异常处理。/shopping/ 已在 ywljsec-master/ywljsec/urls.py 暴露，传入不存在的 username 或 name 可触发未捕获异常，在 DEBUG=True 下会返回 Django 调试页。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/ywljsec/settings.py:26</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/ywljsec/settings.py:26</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">配置项</div>
+                      
+                        <div class="field-value">DEBUG = True</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">暴露机制</div>
+                      
+                        <pre>应用启用了 Django 调试模式。只要请求命中未捕获异常，服务端就会向客户端返回包含 traceback、源码路径、配置项和运行环境细节的调试错误页，形成敏感信息泄露。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">升级建议</div>
+                      
+                        <pre>在所有非开发环境中将 DEBUG 设为 False，并通过环境变量区分环境；同时为 /shopping/ 等视图补充异常处理，统一返回通用错误页或最小化错误响应；确保未授权用户无法访问任何调试输出。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>settings.py 第 26 行启用 DEBUG。shopping 视图在 POST 分支中直接执行 userinfo.objects.get(username=username) 和 commodityinfo.objects.get(name=name)，未进行异常处理。传入不存在的 username 时会抛出 DoesNotExist 异常；在 DEBUG=True 下，Django 会返回完整调试页面而不是通用错误响应。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码 / 配置</div>
+                      
+                        <pre>DEBUG = True
+
+@csrf_exempt
+def shopping(request):
+    ...
+    elif request.method==&#39;POST&#39;:
+        username = request.GET.get(&#34;username&#34;)
+        ...
+        userrs = userinfo.objects.get(username=username)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=nonexistent-user HTTP/1.1
+Host: 127.0.0.1:8000
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 24
+
+name=test&amp;price=1&amp;num=1</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">复现步骤</div>
+                      
+                        <pre>1. 启动应用并保持默认配置。2. 发送对 /shopping/ 的 POST 请求，令查询参数 username 为不存在的用户名。3. 由于 views.py 中对 userinfo.objects.get(username=username) 没有 try/except，服务端会抛出未处理异常。4. 因 settings.py 中 DEBUG=True，响应将包含 Django 调试页，泄露 traceback、文件路径、组件信息及其他诊断细节。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>远程攻击者可以通过构造异常请求收集源码路径、框架配置、安装组件及运行时细节，为后续攻击、定向利用和环境指纹识别提供高价值情报。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+            
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #f97316;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">文件操作审计</h3>
+              <p class="stage-description">上传、下载、遍历与包含类风险审计</p>
+            </div>
+            <div class="severity-row">
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-17 23:30:54</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">该阶段已完成，未发现已确认漏洞。</p>
+
+          
+            <div class="state-note">该阶段已执行完成，未发现已确认漏洞。本结果会保留在导出报告中，便于后续追踪与留档。</div>
+          
+        </div>
+      </article>
+      
+      <article class="stage-shell" style="--accent: #f43f5e;">
+        <div class="stage-head">
+          <div class="stage-head-top">
+            <div>
+              <h3 class="stage-title">业务逻辑审计</h3>
+              <p class="stage-description">流程滥用与业务规则绕过审计</p>
+            </div>
+            <div class="severity-row">
+              
+                <span class="severity-chip" style="ZgotmplZ">高危 · 5</span>
+              
+                <span class="severity-chip" style="ZgotmplZ">中危 · 2</span>
+              
+            </div>
+          </div>
+          <div class="stage-summary">
+            <div class="stage-stat">
+              <div class="stat-label">发现数</div>
+              <strong>7</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">文件数</div>
+              <strong>7</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">接口数</div>
+              <strong>3</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">驳回数</div>
+              <strong>0</strong>
+            </div>
+            <div class="stage-stat">
+              <div class="stat-label">完成时间</div>
+              <strong style="font-size:15px;">2026-04-17 23:23:04</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <p style="margin-top:0;color:#334155;">本报告纳入 7 条发现。</p>
+
+          
+            
+              <article class="finding-card" id="logic-1">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Amount/Quantity Tampering</h4>
+                    <p class="finding-desc">购买接口将客户端传入的 price 直接用于结算。攻击者可以把商品价格改成极低值甚至负值，从而以未授权价格购买商品，或制造异常资金变动。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 ywljsec-master/apps/views.py 的 shopping POST 分支确认：代码读取 request.POST 的 price 与 num，查询 commodityinfo.objects.get(name=name) 后仅取出 cmrs.limit，未使用 cmrs.price；金额直接由 total = int(num)*float(price) 计算，并据此执行 userrs.money = money-total。该路径明确支持客户端改价后按伪造价格结算。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:144</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：price</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:144</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">商品购买结算</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">提交带有伪造价格的购买请求</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>price
+num
+userrs.money
+cmrs.limit</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者知道任意已存在的 username，且目标商品名称存在。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>购买流程本应以服务端商品表中的 commodityinfo.price 作为唯一结算依据，在校验余额后再扣减用户余额和库存；但实际流程直接使用客户端提交的 price 参与 total 计算，导致订单从“待校验”直接进入“按篡改金额结算”的错误状态。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>服务端查询了商品对象 cmrs，却没有使用 cmrs.price 重新计算金额，而是信任 request.POST.get(&#34;price&#34;)。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>代码先读取 request.POST 中的 price 和 num，然后执行 total = int(num) * float(price)。后续仅比较 total 与用户余额，随后直接执行 userrs.money = money - total，并扣减库存。整个过程中没有使用数据库中的商品真实价格 crs.price 或 cmrs.price 进行服务端重算。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>price = request.POST.get(&#34;price&#34;)
+num = request.POST.get(&#34;num&#34;)
+...
+total = int(num)*float(price)
+if total&gt; money:
+    return JsonResponse({&#34;msg&#34;:&#34;你的金额不够&#34;})
+
+userrs.money = money-total</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=testuser HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+
+name=Widget&amp;price=0.01&amp;num=1</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 先调用初始化接口或使用现有数据，确保存在某个用户名和商品名。2. 正常浏览购物页可获知商品名。3. 向购买接口提交真实商品名，但把 price 改成远低于真实价格的值，例如 0.01。4. 观察接口返回“购买成功”，且服务端按伪造价格扣款而非按数据库商品价格扣款。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可以低价甚至异常价格购买商品，造成直接资金损失、库存被错误消耗，并破坏账务与订单结算准确性。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-2">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Amount/Quantity Tampering</h4>
+                    <p class="finding-desc">购买接口缺少数量下界校验。攻击者提交负数数量后，系统会把本应扣减的金额变成入账，把本应扣减的库存变成补库存，相当于可凭空增加余额和商品库存。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已确认 shopping POST 分支仅执行 if int(num)&gt;limit 的上限判断，没有任何 num&gt;0 或非负校验。随后 total = int(num)*float(price)、userrs.money = money-total、cmrs.limit = limit-int(num)。当 num 为负数时，total 为负，余额会增加，库存也会增加，结论与当前发现一致。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:141</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：num</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:141</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">商品购买数量校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">提交负数购买数量以反向修改余额和库存</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>num
+total
+userrs.money
+cmrs.limit</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者知道任意已存在的 username，且目标商品名称存在。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>购买流程本应只允许正整数购买数量，并在数量不超过库存时扣减余额与库存；但实际仅校验 num 是否大于库存上限，没有校验 num 必须大于 0，导致请求可从“购买商品”错误进入“增加账户余额并增加库存”的非法状态。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>通过提交负数 num 绕过唯一的上限校验 if int(num)&gt;limit，使 total 变成负数，随后 money-total 反而增加余额，limit-int(num) 反而增加库存。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>代码只做了 if int(num)&gt;limit 的上限检查，没有检查 num &lt;= 0 的情况。随后 total = int(num) * float(price) 在 num 为负数时得到负值，余额更新逻辑 userrs.money = money-total 会增加用户余额，而库存更新 cmrs.limit = limit-int(num) 会增加库存。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>limit = cmrs.limit
+if int(num)&gt;limit:
+    return JsonResponse({&#34;msg&#34;:&#34;超过商品限制&#34;})
+
+total = int(num)*float(price)
+...
+userrs.money = money-total
+...
+cmrs.limit = limit-int(num)</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=testuser HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+
+name=Widget&amp;price=100&amp;num=-5</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 准备一个存在的用户名和商品名。2. 向购买接口提交 num 为负数，例如 -5。3. 由于 -5 不大于库存上限，校验通过。4. 观察接口返回“购买成功”，并根据代码逻辑可验证用户余额被增加、商品库存被增加。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可以无成本刷高账户余额并人为增加库存，破坏资金与库存的核心业务约束，导致严重财务和履约数据失真。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-3">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">初始结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Race Condition</h4>
+                    <p class="finding-desc">购买接口存在典型的检查后执行竞争条件。并发请求会共享旧余额和旧库存进行判断，导致超卖、重复购买成功，甚至因覆盖写导致少扣款。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已确认 shopping POST 分支采用“先读到局部变量 money/limit，再校验，再分别 save”的实现，没有看到 transaction.atomic、select_for_update 或 F 表达式原子更新。该代码结构客观存在检查后执行竞争窗口，并可能因并发覆盖写造成超卖或账务/库存不一致。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:137</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">POST /shopping/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：username</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:137</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">商品购买扣款与库存扣减</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">并发重复提交购买请求</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>POST /shopping/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>userrs.money
+cmrs.limit
+money
+limit</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者知道任意已存在的 username 和商品名，并可同时发起两个或多个购买请求。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>购买流程本应在单个原子事务内完成“读取余额/库存→校验→扣款→扣库存”，确保每次购买都基于最新状态；但实际是先读取 money 和 limit，再分别 save，缺少事务、锁和原子更新，导致多个请求可基于同一旧状态同时成功。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">竞态窗口</div>
+                      
+                        <pre>窗口位于读取 userrs.money 与 cmrs.limit 之后、执行两次 save 之前。多个并发请求都可能在看到相同余额和库存时通过校验，并用同一旧值覆盖更新结果。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>利用读-校验-写分离且无事务锁的检查后执行窗口，并发发送购买请求，使多个请求同时通过余额和库存检查。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>代码先把 userrs.money 赋给局部变量 money，把 cmrs.limit 赋给局部变量 limit；随后基于这两个旧值执行 if int(num)&gt;limit 和 if total&gt;money；最后分别执行 userrs.money = money-total、userrs.save()、cmrs.limit = limit-int(num)、cmrs.save()。没有 transaction.atomic、select_for_update 或 F 表达式原子更新。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>userrs = userinfo.objects.get(username=username)
+money = userrs.money
+cmrs = commodityinfo.objects.get(name=name)
+limit = cmrs.limit
+if int(num)&gt;limit:
+    return JsonResponse({&#34;msg&#34;:&#34;超过商品限制&#34;})
+
+total = int(num)*float(price)
+if total&gt; money:
+    return JsonResponse({&#34;msg&#34;:&#34;你的金额不够&#34;})
+
+userrs.money = money-total
+userrs.save()
+cmrs.limit = limit-int(num)
+cmrs.save()</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>POST /shopping/?username=testuser HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+
+name=Widget&amp;price=80&amp;num=1</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 选择一个余额只足够一次购买或库存只剩 1 件的用户名和商品。2. 使用两个并发客户端同时发送完全相同的购买请求。3. 两个请求都会先读取同一份旧余额和旧库存，并同时通过校验。4. 观察两个请求都返回“购买成功”；按代码逻辑，可能出现卖出 2 件但库存仅记录为 0，或实际买了两次但余额只按一次结果覆盖保存。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可通过并发重放实现超卖、重复购买成功、库存与账务不一致，严重破坏库存控制与资金结算正确性。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-4">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">补扫结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Workflow Bypass</h4>
+                    <p class="finding-desc">短信验证流程缺少必填验证码校验。攻击者无需收到任何短信，也无需知道缓存中的验证码，即可直接让服务端返回校验成功。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已在 msg_code 函数中确认 noauth 分支存在显式绕过：读取缓存后先判断 if rcode==None，并立即返回“短信验证码校验成功”。该逻辑不要求提交验证码，也不要求命中缓存中的真实验证码，漏洞成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:223</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /msg_code/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：attack_type</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:223</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">短信验证码校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">不提交验证码直接完成校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /msg_code/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>attack_type
+phone
+code</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者知道或自选任意手机号，并能访问短信验证码接口。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>正常流程应为“先发送验证码并缓存到 phone 对应键值，再提交收到的 code 完成校验”；但在 noauth 分支中，只要不提供 code 参数，请求会直接从“未验证”跳到“校验成功”。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>将 attack_type 设为 noauth，并省略 code 参数，命中 if rcode==None: return JsonResponse({&#34;msg&#34;: &#34;短信验证码校验成功&#34;, &#34;code&#34;: 200}) 的绕过分支。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>msg_code 先读取 GET 参数 phone、attack_type、code。进入 attack_type==&#39;noauth&#39; 分支后，从缓存读取验证码，但随后先判断 if rcode==None 并直接返回成功，完全跳过了“提交验证码并与缓存值比对”的关键业务步骤。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif attack_type==&#39;noauth&#39;:
+    code = cache.get(f&#39;phone_{phone}&#39;)
+    try:
+        if rcode==None:
+            return JsonResponse({&#34;msg&#34;: &#34;短信验证码校验成功&#34;, &#34;code&#34;: 200})</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /msg_code/?phone=13800138000&amp;attack_type=noauth HTTP/1.1
+Host: target</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 直接向短信接口发送 noauth 模式请求，不提供 code 参数。2. 服务端进入 noauth 分支后命中 rcode==None 条件。3. 观察响应立即返回“短信验证码校验成功”。4. 该结果表明验证码提交步骤可被完全跳过。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可以绕过基于短信验证码的业务确认步骤，破坏注册、绑卡、找回、敏感操作确认等依赖短信校验的业务门槛。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-5">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">高危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">补扫结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Business Rule Bypass</h4>
+                    <p class="finding-desc">短信校验逻辑内置了全局固定验证码 888888。攻击者无需知道服务端为目标手机号生成的真实动态码，就能直接完成验证。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已确认 msg_code 的 constant 分支首个判断就是 if rcode == &#39;888888&#39;: return success。该分支未读取缓存中的手机号验证码，也未做手机号绑定校验，因此固定验证码 888888 可直接通行，发现成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:234</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /msg_code/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：code</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:234</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">短信验证码校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">使用固定万能验证码通过校验</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /msg_code/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>attack_type
+code
+phone</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者可以访问短信验证码接口，无需先获取目标手机号的真实验证码。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>正常流程应只接受服务端为该手机号生成并保存的动态验证码；但 constant 分支允许任何请求直接凭固定值 888888 从“未持有真实验证码”进入“校验成功”状态。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>将 attack_type 设为 constant，并把 code 固定提交为 888888，即可绕过手机号对应的动态验证码验证规则。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>在 attack_type == &#39;constant&#39; 分支中，代码首先判断 if rcode == &#39;888888&#39;，满足后立刻返回校验成功；整个流程没有读取缓存验证码，也没有将提交值与目标手机号已发送的真实短信码进行绑定校验。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif attack_type == &#39;constant&#39;:
+
+    if rcode == &#39;888888&#39;:
+        return JsonResponse({&#34;msg&#34;: &#34;短信验证码校验成功&#34;, &#34;code&#34;: 200})</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /msg_code/?phone=13800138000&amp;attack_type=constant&amp;code=888888 HTTP/1.1
+Host: target</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 向短信接口发送 constant 模式请求。2. 将 code 参数设置为 888888。3. 观察响应直接返回“短信验证码校验成功”。4. 该过程不依赖目标手机号的真实短信码。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可批量绕过短信验证这一业务门槛，导致依赖短信验证码的开户、注册、找回或高风险操作确认形同虚设。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-6">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">中危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">补扫结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Business Rule Bypass</h4>
+                    <p class="finding-desc">注册接口存在可直接跳过唯一性检查的分支。攻击者能够用已注册手机号或同名账号继续创建新记录，破坏“一人一号/一手机号一账号”的核心注册规则。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已确认 register 的 cover 分支直接执行 userinfo.objects.create(username=username, phone=phone, password=password)，未做重复校验。models.py 中 userinfo 的 username 和 phone 也未设置 unique 约束，因此重复手机号或用户名可以被直接写入数据库。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:279</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /register/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：attack_type</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:279</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">用户注册</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">重复使用已注册手机号或用户名继续开户</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /register/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>attack_type
+phone
+username
+password</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者可以访问注册接口，并知道一个已存在或计划重复使用的手机号/用户名。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>注册流程本应在创建用户前校验手机号或账号的唯一性，并拒绝重复注册；但在 cover 分支中，系统跳过唯一性检查，直接把重复数据写入用户表。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>将 attack_type 设为 cover，直接命中 userinfo.objects.create(...) 分支，绕过注册前的重复性检查。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>register 在 attack_type==&#39;cover&#39; 时不执行任何 phone 或 username 的存在性判断，直接调用 userinfo.objects.create(username=username, phone=phone, password=password)。模型层也未对 phone 或 username 设置 unique 约束，因此重复账号会被持久化。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>elif attack_type==&#39;cover&#39;:
+    userinfo.objects.create(
+        username=username,
+        phone=phone,
+        password=password,
+    )</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /register/?attack_type=cover&amp;phone=13800138000&amp;username=existing_user&amp;password=pass123 HTTP/1.1
+Host: target</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 先确保某个手机号或用户名已存在于系统中。2. 调用注册接口并将 attack_type 设置为 cover，同时提交相同手机号或相同用户名。3. 观察接口直接返回注册成功。4. 如继续访问 cover_check，可取到最新重复记录，证明重复开户已落库。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可以绕过账号唯一性和手机号唯一性规则批量创建重复账户，导致账户归属、风控、营销资格和用户数据一致性被破坏。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+              <article class="finding-card" id="logic-7">
+                <div class="finding-header">
+                  <div>
+                    <div class="severity-row">
+                      <span class="severity-chip" style="ZgotmplZ">中危</span>
+                      <span class="severity-chip" style="ZgotmplZ">已确认</span>
+                      
+                        <span class="severity-chip" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">补扫结果</span>
+                      
+                    </div>
+                    <h4 class="finding-title">Race Condition</h4>
+                    <p class="finding-desc">注册去重逻辑存在典型的检查后执行竞争条件。并发请求能够同时通过“该手机号尚未注册”的判断，从而为同一手机号创建多个账户。</p>
+                    
+                      <p class="finding-desc" style="margin-top:8px;"><strong>复核说明：</strong>已确认 register 的 arbitrarily 分支先 count 再 create，属于典型检查后执行模式；同时 models.py 中 phone 未设置 unique 约束，代码中也未使用事务或锁。并发请求可以同时观察到 ct=0 并分别创建记录，因此竞争条件结论成立。</p>
+                    
+                  </div>
+                  
+                    <div style="text-align:right;color:#475569;font-size:13px;">ywljsec-master/apps/views.py:259</div>
+                  
+                </div>
+
+                <div class="finding-grid">
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发接口</div>
+                      <div class="field-value">GET /register/</div>
+                      
+                        <div class="field-value" style="margin-top:8px;color:#475569;">参数：phone</div>
+                      
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">源码位置</div>
+                      <div class="field-value">ywljsec-master/apps/views.py:259</div>
+                    </div>
+                  
+
+                  
+                    <div class="field-card">
+                      <div class="field-label">证明类型</div>
+                      
+                        <div class="field-value">HTTP</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务流程名称</div>
+                      
+                        <div class="field-value">用户注册去重</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">业务动作</div>
+                      
+                        <div class="field-value">并发提交同手机号注册请求</div>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">受影响接口</div>
+                      
+                        <pre>GET /register/</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">可操纵字段</div>
+                      
+                        <pre>phone
+username
+password
+ct</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">前置条件</div>
+                      
+                        <pre>攻击者可同时发起多个注册请求，且目标手机号当前尚未注册。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">状态迁移</div>
+                      
+                        <pre>正常流程应在单个原子步骤中完成“检查手机号未注册→创建账户”，保证同一手机号只能成功一次；但当前实现先 count 再 create，多个并发请求可基于同一旧状态同时进入创建分支。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">竞态窗口</div>
+                      
+                        <pre>窗口位于 userinfo.objects.filter(phone=phone).count() 返回 0 之后、userinfo.objects.create(...) 执行之前。并发请求都可能看到 ct=0，并各自创建一条记录。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">绕过方式</div>
+                      
+                        <pre>利用 count 与 create 之间缺少事务和唯一约束的竞争窗口，同时提交多个相同手机号的 arbitrarily 注册请求。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">执行逻辑</div>
+                      
+                        <pre>attack_type==&#39;arbitrarily&#39; 分支先执行 ct = userinfo.objects.filter(phone=phone).count()，当 ct==0 时再调用 userinfo.objects.create(...)。模型中 phone 没有 unique 约束，也没有 transaction.atomic 或锁，因此并发时会产生重复注册。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">漏洞代码</div>
+                      
+                        <pre>ct = userinfo.objects.filter(phone=phone).count()
+if ct &gt;0:
+    return JsonResponse({&#34;code&#34;:0,&#34;msg&#34;:&#34;该用户已经注册&#34;})
+else:
+    userinfo.objects.create(
+        username=username,
+        phone=phone,
+        password=password,
+    )</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">原始 HTTP POC</div>
+                      
+                        <pre>GET /register/?attack_type=arbitrarily&amp;phone=13800138000&amp;username=userA&amp;password=pass123 HTTP/1.1
+Host: target</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">触发步骤</div>
+                      
+                        <pre>1. 选择一个当前未注册的手机号。2. 使用两个并发客户端同时向注册接口发送 attack_type=arbitrarily 的相同手机号请求，可使用不同用户名。3. 两个请求都会先读到 ct=0。4. 观察两个请求都可能注册成功，从而生成多条相同手机号记录。</pre>
+                      
+                    </div>
+                  
+                    <div class="field-card">
+                      <div class="field-label">影响</div>
+                      
+                        <pre>攻击者可通过并发注册突破“一手机号一次注册”的业务约束，造成重复账户、营销资格滥用和用户身份绑定混乱。</pre>
+                      
+                    </div>
+                  
+                </div>
+              </article>
+            
+            
+          
+        </div>
+      </article>
+      
+    </section>
+
+    <div class="footer">
+      由 CodeScan 生成。本 HTML 文件为自包含格式，可离线打开。
+    </div>
+  </main>
+</body>
+</html>
