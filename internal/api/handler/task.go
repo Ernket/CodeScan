@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,16 +12,108 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"codescan/internal/config"
 	"codescan/internal/database"
 	"codescan/internal/model"
+	"codescan/internal/service/orchestration"
 	"codescan/internal/service/scanner"
 	summarysvc "codescan/internal/service/summary"
 	"codescan/internal/utils"
 )
+
+type taskDetailResponse struct {
+	model.Task
+	Orchestration *orchestration.TaskSummary `json:"orchestration,omitempty"`
+}
+
+var (
+	launchTaskOrchestration = func(taskID string) error {
+		_, err := orchestration.DefaultManager().Start(taskID)
+		return err
+	}
+	launchLegacyInitScan = func(task *model.Task) {
+		scanner.RunAIScan(task, "init")
+	}
+	loadTaskStatus = func(taskID string) (string, error) {
+		var task model.Task
+		if err := database.DB.Select("status").First(&task, "id = ?", taskID).Error; err != nil {
+			return "", err
+		}
+		return task.Status, nil
+	}
+	persistTask = func(task *model.Task) error {
+		return database.DB.Save(task).Error
+	}
+	persistTaskStatus = func(taskID, status string) error {
+		return database.DB.Model(&model.Task{}).Where("id = ?", taskID).Update("status", status).Error
+	}
+	loadTaskWithStagesForControl = func(taskID string) (model.Task, error) {
+		var task model.Task
+		err := database.DB.Preload("Stages").First(&task, "id = ?", taskID).Error
+		return task, err
+	}
+	loadTaskForControl = func(taskID string) (model.Task, error) {
+		var task model.Task
+		err := database.DB.First(&task, "id = ?", taskID).Error
+		return task, err
+	}
+	saveTaskForControl = func(task *model.Task) error {
+		return database.DB.Save(task).Error
+	}
+	saveTaskStageForControl = func(stage *model.TaskStage) error {
+		return database.DB.Save(stage).Error
+	}
+	markTaskOrchestrationPaused = func(taskID string) error {
+		return orchestration.DefaultManager().MarkPaused(taskID)
+	}
+	loadTaskOrchestrationSummary = func(taskID string) (*orchestration.TaskSummary, error) {
+		return orchestration.DefaultManager().Summary(taskID)
+	}
+	resumeTaskOrchestration = func(taskID string) (*orchestration.Snapshot, error) {
+		return orchestration.DefaultManager().Resume(taskID)
+	}
+	resumeLegacyTaskScan = func(task *model.Task) (string, error) {
+		return scanner.ResumeAIScan(task)
+	}
+	taskLogClock = time.Now
+	newTaskID    = utils.NewOpaqueID
+)
+
+func formatTaskLogEntry(message string) string {
+	return fmt.Sprintf("[%s] %s", taskLogClock().Format("15:04:05"), message)
+}
+
+func autoStartUploadedTask(task *model.Task) error {
+	if !config.Orchestration.Enabled {
+		task.Status = "running"
+		if err := persistTaskStatus(task.ID, "running"); err != nil {
+			return err
+		}
+		launchLegacyInitScan(task)
+		return nil
+	}
+
+	if err := launchTaskOrchestration(task.ID); err == nil {
+		task.Status = "running"
+		return nil
+	} else {
+		status, statusErr := loadTaskStatus(task.ID)
+		if statusErr == nil && strings.EqualFold(status, "running") {
+			task.Status = "running"
+			return nil
+		}
+
+		message := fmt.Sprintf("Automatic orchestration failed to start: %v", err)
+		log.Printf("warning: task %s auto-start failed: %v", task.ID, err)
+
+		task.Status = "failed"
+		task.Result = message
+		task.Logs = append(task.Logs, formatTaskLogEntry(message))
+		return persistTask(task)
+	}
+}
 
 func GetTasksHandler(c *gin.Context) {
 	list, err := loadTasksForSummary()
@@ -42,7 +135,15 @@ func GetTaskDetailHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, task)
+	summary, err := orchestration.DefaultManager().Summary(task.ID)
+	if err != nil {
+		log.Printf("warning: failed to build orchestration summary for task %s: %v", task.ID, err)
+	}
+
+	c.JSON(http.StatusOK, taskDetailResponse{
+		Task:          task,
+		Orchestration: summary,
+	})
 }
 
 func loadTasksForSummary() ([]model.Task, error) {
@@ -90,7 +191,7 @@ func UploadHandler(c *gin.Context) {
 	}
 
 	// Create Task
-	id := strings.ReplaceAll(uuid.New().String(), "-", "")
+	id := newTaskID()
 	projectPath := filepath.Join(config.ProjectsDir, id)
 
 	// Save Zip
@@ -120,8 +221,16 @@ func UploadHandler(c *gin.Context) {
 		OutputJSON: json.RawMessage([]byte("{}")),
 	}
 
-	database.DB.Create(task)
-	go scanner.RunAIScan(task, "init")
+	if err := database.DB.Create(task).Error; err != nil {
+		os.RemoveAll(projectPath)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
+		return
+	}
+	if err := autoStartUploadedTask(task); err != nil {
+		log.Printf("warning: task %s created but failed to initialize execution: %v", task.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize task"})
+		return
+	}
 
 	c.JSON(http.StatusOK, task)
 }
@@ -140,8 +249,70 @@ type taskDeletionStore interface {
 	DeleteTask(id string) (model.Task, error)
 }
 
+var taskScopedDeletionTables = []string{
+	"task_findings",
+	"task_routes",
+	"task_events",
+	"task_agent_runs",
+	"task_subtasks",
+	"task_runs",
+	"task_stages",
+}
+
 type gormTaskDeletionStore struct {
 	db *gorm.DB
+}
+
+type taskScopedDeletionExecutor interface {
+	DeleteByTaskID(table, taskID string) error
+	DeleteTaskRecord(task *model.Task) (int64, error)
+}
+
+type gormTaskDeletionExecutor struct {
+	tx *gorm.DB
+}
+
+func (e gormTaskDeletionExecutor) DeleteByTaskID(table, taskID string) error {
+	switch table {
+	case "task_findings":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskFinding{}).Error
+	case "task_routes":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskRoute{}).Error
+	case "task_events":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskEvent{}).Error
+	case "task_agent_runs":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskAgentRun{}).Error
+	case "task_subtasks":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskSubtask{}).Error
+	case "task_runs":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskRun{}).Error
+	case "task_stages":
+		return e.tx.Where("task_id = ?", taskID).Delete(&model.TaskStage{}).Error
+	default:
+		return fmt.Errorf("unsupported deletion table %q", table)
+	}
+}
+
+func (e gormTaskDeletionExecutor) DeleteTaskRecord(task *model.Task) (int64, error) {
+	result := e.tx.Delete(task)
+	return result.RowsAffected, result.Error
+}
+
+func executeTaskScopedDeletion(executor taskScopedDeletionExecutor, task *model.Task) error {
+	for _, table := range taskScopedDeletionTables {
+		if err := executor.DeleteByTaskID(table, task.ID); err != nil {
+			return fmt.Errorf("delete %s: %w", table, err)
+		}
+	}
+
+	rowsAffected, err := executor.DeleteTaskRecord(task)
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return errTaskDeleteNotFound
+	}
+	return nil
 }
 
 func (s gormTaskDeletionStore) DeleteTask(id string) (model.Task, error) {
@@ -159,19 +330,7 @@ func (s gormTaskDeletionStore) DeleteTask(id string) (model.Task, error) {
 			return errTaskDeleteRunning
 		}
 
-		if err := tx.Where("task_id = ?", task.ID).Delete(&model.TaskStage{}).Error; err != nil {
-			return err
-		}
-
-		deleteResult := tx.Delete(&task)
-		if deleteResult.Error != nil {
-			return deleteResult.Error
-		}
-		if deleteResult.RowsAffected == 0 {
-			return errTaskDeleteNotFound
-		}
-
-		return nil
+		return executeTaskScopedDeletion(gormTaskDeletionExecutor{tx: tx}, &task)
 	})
 
 	return task, err
@@ -203,39 +362,92 @@ func DeleteTaskHandler(c *gin.Context) {
 
 func PauseTaskHandler(c *gin.Context) {
 	id := c.Param("id")
-	var task model.Task
-	if err := database.DB.Preload("Stages").First(&task, "id = ?", id).Error; err != nil {
+	task, err := loadTaskWithStagesForControl(id)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
 		return
 	}
 
+	switch strings.ToLower(strings.TrimSpace(task.Status)) {
+	case "running":
+	case "paused":
+		c.JSON(http.StatusConflict, gin.H{"error": "Task is already paused"})
+		return
+	default:
+		c.JSON(http.StatusConflict, gin.H{"error": "Only running tasks can be paused"})
+		return
+	}
+
 	task.Status = "paused"
-	database.DB.Save(&task)
-	for _, stage := range task.Stages {
+	if err := saveTaskForControl(&task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to pause task"})
+		return
+	}
+	for i := range task.Stages {
+		stage := &task.Stages[i]
 		if stage.Status == "running" {
 			stage.Status = "paused"
-			database.DB.Save(&stage)
+			if err := saveTaskStageForControl(stage); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to pause task"})
+				return
+			}
 		}
+	}
+	if err := markTaskOrchestrationPaused(id); err != nil {
+		log.Printf("warning: failed to pause orchestration for task %s: %v", id, err)
 	}
 	c.JSON(http.StatusOK, task)
 }
 
 func ResumeTaskHandler(c *gin.Context) {
 	id := c.Param("id")
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
+	task, err := loadTaskForControl(id)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
 		return
 	}
 
+	switch strings.ToLower(strings.TrimSpace(task.Status)) {
+	case "paused":
+	case "running":
+		c.JSON(http.StatusConflict, gin.H{"error": "Task is already running"})
+		return
+	default:
+		c.JSON(http.StatusConflict, gin.H{"error": "Only paused tasks can be resumed"})
+		return
+	}
+
+	summary, err := loadTaskOrchestrationSummary(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to inspect task runtime"})
+		return
+	}
+	if summary != nil && summary.LastRunStatus == "paused" {
+		snapshot, resumeErr := resumeTaskOrchestration(id)
+		if resumeErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": resumeErr.Error()})
+			return
+		}
+		task.Status = "running"
+		if err := saveTaskForControl(&task); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resume task"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "resumed", "mode": "orchestration", "task": task, "orchestration": snapshot})
+		return
+	}
+
 	task.BasePath = task.GetBasePath()
-	stage, err := scanner.ResumeAIScan(&task)
+	stage, err := resumeLegacyTaskScan(&task)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	task.Status = "running"
-	database.DB.Save(&task)
+	if err := saveTaskForControl(&task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resume task"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "resumed", "stage": stage, "task": task})
 }
 

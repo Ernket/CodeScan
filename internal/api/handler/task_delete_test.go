@@ -19,6 +19,12 @@ type fakeTaskDeletionStore struct {
 	deleteErr error
 }
 
+type fakeTaskScopedDeletionExecutor struct {
+	calls       []string
+	deleteErrAt string
+	rows        int64
+}
+
 func (s *fakeTaskDeletionStore) DeleteTask(id string) (model.Task, error) {
 	task, ok := s.tasks[id]
 	if !ok {
@@ -34,6 +40,22 @@ func (s *fakeTaskDeletionStore) DeleteTask(id string) (model.Task, error) {
 	delete(s.tasks, id)
 	delete(s.stages, id)
 	return task, nil
+}
+
+func (f *fakeTaskScopedDeletionExecutor) DeleteByTaskID(table, taskID string) error {
+	f.calls = append(f.calls, table+":"+taskID)
+	if f.deleteErrAt == table {
+		return errors.New("delete failed")
+	}
+	return nil
+}
+
+func (f *fakeTaskScopedDeletionExecutor) DeleteTaskRecord(task *model.Task) (int64, error) {
+	f.calls = append(f.calls, "tasks:"+task.ID)
+	if f.deleteErrAt == "tasks" {
+		return 0, errors.New("delete failed")
+	}
+	return f.rows, nil
 }
 
 func TestDeleteTaskHandlerDeletesTaskAndStages(t *testing.T) {
@@ -77,6 +99,61 @@ func TestDeleteTaskHandlerDeletesTaskAndStages(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"status":"deleted"`) {
 		t.Fatalf("expected deleted response body, got %s", w.Body.String())
+	}
+}
+
+func TestExecuteTaskScopedDeletionDeletesAllTaskTablesInOrder(t *testing.T) {
+	executor := &fakeTaskScopedDeletionExecutor{rows: 1}
+	task := &model.Task{ID: "task-1"}
+
+	if err := executeTaskScopedDeletion(executor, task); err != nil {
+		t.Fatalf("executeTaskScopedDeletion returned error: %v", err)
+	}
+
+	expected := []string{
+		"task_findings:task-1",
+		"task_routes:task-1",
+		"task_events:task-1",
+		"task_agent_runs:task-1",
+		"task_subtasks:task-1",
+		"task_runs:task-1",
+		"task_stages:task-1",
+		"tasks:task-1",
+	}
+	if len(executor.calls) != len(expected) {
+		t.Fatalf("expected %d deletion calls, got %d (%v)", len(expected), len(executor.calls), executor.calls)
+	}
+	for idx, call := range expected {
+		if executor.calls[idx] != call {
+			t.Fatalf("expected deletion call %d to be %q, got %q", idx, call, executor.calls[idx])
+		}
+	}
+}
+
+func TestDeleteTaskHandlerAllowsPausedTasks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := &fakeTaskDeletionStore{
+		tasks: map[string]model.Task{
+			"task-1": {
+				ID:       "task-1",
+				Status:   "paused",
+				BasePath: `E:\code\CodeScan-Claude\projects\task-1`,
+			},
+		},
+		stages: map[string][]model.TaskStage{
+			"task-1": {
+				{ID: 1, TaskID: "task-1", Name: "auth", Status: "paused"},
+			},
+		},
+	}
+
+	setDeleteTestDeps(t, store, func(string) error { return nil })
+
+	w := performDeleteTaskRequest("task-1")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
 	}
 }
 

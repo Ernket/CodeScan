@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue'
+import { hasStagePayload, parseResultArray, splitFindings } from '../utils/findings'
 
 const props = defineProps({
   task: {
@@ -30,13 +31,9 @@ const stageCards = computed(() => {
   return props.stageDefinitions.map(definition => {
     const stage = props.task?.stages?.find(item => item.name === definition.key) || null
     const parsed = parseResultArray(stage?.output_json || stage?.result)
-    const hasRawPayload = Boolean(
-      typeof stage?.result === 'string' && stage.result.trim() ||
-      Array.isArray(stage?.output_json) ||
-      typeof stage?.output_json === 'string' && stage.output_json.trim() && stage.output_json !== '{}' && stage.output_json !== 'null' ||
-      stage?.output_json && typeof stage.output_json === 'object' && Object.keys(stage.output_json).length > 0
-    )
-    const findingCount = Array.isArray(parsed) ? parsed.length : null
+    const findingGroups = splitFindings(parsed || [])
+    const findingCount = Array.isArray(parsed) ? findingGroups.active.length : null
+    const rejectedCount = Array.isArray(parsed) ? findingGroups.rejected.length : 0
     const status = stage?.status || 'pending'
 
     let detail = props.t('taskStrip.waitingToRun')
@@ -44,11 +41,13 @@ const stageCards = computed(() => {
       detail = props.t('taskStrip.auditInProgress')
     } else if (status === 'failed') {
       detail = props.t('taskStrip.lastRunFailed')
+    } else if (status === 'completed' && findingCount > 0) {
+      detail = props.t('taskStrip.findingsCount', { count: findingCount })
+    } else if (status === 'completed' && findingCount === 0 && rejectedCount > 0) {
+      detail = props.t('taskStrip.allRejected')
     } else if (status === 'completed' && findingCount === 0) {
       detail = props.t('taskStrip.cleanResult')
-    } else if (status === 'completed' && findingCount !== null) {
-      detail = props.t('taskStrip.findingsCount', { count: findingCount })
-    } else if (status === 'completed' && hasRawPayload) {
+    } else if (status === 'completed' && hasStagePayload(stage)) {
       detail = props.t('taskStrip.rawExportReady')
     }
 
@@ -57,6 +56,7 @@ const stageCards = computed(() => {
       stage,
       status,
       findingCount,
+      rejectedCount,
       detail,
       updatedAt: stage?.updated_at ? new Date(stage.updated_at).toLocaleString(props.locale === 'en' ? 'en-US' : 'zh-CN') : '',
       active: props.currentView === definition.view,
@@ -66,35 +66,6 @@ const stageCards = computed(() => {
 
 function displayStatus(status) {
   return props.t(`status.${String(status || '').trim().toLowerCase() || 'pending'}`)
-}
-
-function parseResultArray(raw) {
-  if (!raw) return null
-
-  try {
-    if (Array.isArray(raw)) return raw
-    if (raw && typeof raw === 'object') return null
-
-    let text = String(raw).trim()
-    if (!text) return null
-
-    if (text.startsWith('```json')) {
-      text = text.replace(/^```json\s*/, '').replace(/\s*```$/, '')
-    } else if (text.startsWith('```')) {
-      text = text.replace(/^```\s*/, '').replace(/\s*```$/, '')
-    }
-
-    const start = text.indexOf('[')
-    const end = text.lastIndexOf(']')
-    if (start !== -1 && end !== -1 && end > start) {
-      text = text.slice(start, end + 1)
-    }
-
-    const parsed = JSON.parse(text)
-    return Array.isArray(parsed) ? parsed : null
-  } catch {
-    return null
-  }
 }
 
 function statusBadgeClass(status) {
@@ -144,4 +115,3 @@ function statusBadgeClass(status) {
     </button>
   </div>
 </template>
-

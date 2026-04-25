@@ -12,11 +12,14 @@ import (
 )
 
 var compactableToolNames = map[string]struct{}{
-	"read_file":     {},
-	"list_files":    {},
-	"list_dir_tree": {},
-	"search_files":  {},
-	"grep_files":    {},
+	"read_file":          {},
+	"list_files":         {},
+	"list_dir_tree":      {},
+	"search_files":       {},
+	"grep_files":         {},
+	"query_manifest":     {},
+	"query_routes":       {},
+	"query_stage_output": {},
 }
 
 func artifactIndex(records []runtimeArtifact) string {

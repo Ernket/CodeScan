@@ -21,6 +21,30 @@ func saveTaskRecord(task *model.Task) bool {
 	return tx.RowsAffected > 0
 }
 
+func saveTaskProjection(task *model.Task) bool {
+	if task == nil {
+		return false
+	}
+
+	var current model.Task
+	if err := database.DB.First(&current, "id = ?", task.ID).Error; err != nil {
+		log.Printf("failed to load task %s before saving projection: %v", task.ID, err)
+		return false
+	}
+
+	current.Result = task.Result
+	current.OutputJSON = task.OutputJSON
+	current.Logs = task.Logs
+
+	tx := database.DB.Select("*").Save(&current)
+	if tx.Error != nil {
+		log.Printf("failed to save task projection %s: %v", task.ID, tx.Error)
+		return false
+	}
+
+	return tx.RowsAffected > 0
+}
+
 func saveTaskStageRecord(stage *model.TaskStage) bool {
 	if stage == nil {
 		return false

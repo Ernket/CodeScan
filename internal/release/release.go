@@ -62,6 +62,10 @@ var excludedSuffixes = []string{
 	".exe",
 }
 
+var excludedGlobs = []string{
+	"*-report-*.html",
+}
+
 func CollectReleaseFiles(root string) ([]FileEntry, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
@@ -138,6 +142,12 @@ func IsExcludedPath(relPath string, isDir bool) bool {
 	lower := strings.ToLower(relPath)
 	for _, suffix := range excludedSuffixes {
 		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	for _, pattern := range excludedGlobs {
+		matched, err := filepath.Match(pattern, filepath.Base(lower))
+		if err == nil && matched {
 			return true
 		}
 	}
@@ -324,6 +334,10 @@ func isPlaceholderValue(value string) bool {
 	}
 
 	lower := strings.ToLower(trimmed)
+	switch lower {
+	case "...", "***", "token", "secret", "dummy", "example", "sample", "test", "changeme", "k":
+		return true
+	}
 	if strings.HasPrefix(lower, "replace-with-") {
 		return true
 	}

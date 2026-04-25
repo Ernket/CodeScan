@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"codescan/internal/config"
 	"codescan/internal/model"
 
 	"github.com/sashabaranov/go-openai"
@@ -67,6 +66,18 @@ func newScanSession(task *model.Task, stage, prompt string, reset bool) (*scanSe
 	}
 
 	return session, nil
+}
+
+func EnsureBootstrapAnchor(task *model.Task, stage string) error {
+	task.BasePath = task.GetBasePath()
+	_, err := newScanSession(task, stage, "", false)
+	return err
+}
+
+func HasRuntimeBootstrapAnchor(task *model.Task, stage string) bool {
+	task.BasePath = task.GetBasePath()
+	_, err := os.Stat(filepath.Join(task.StageRuntimePath(stage), runtimeStateFile))
+	return err == nil
 }
 
 func loadScanSession(task *model.Task, stage, prompt string) (*scanSession, error) {
@@ -368,10 +379,6 @@ func (s *scanSession) createArtifact(kind, toolName, path string, startLine, end
 		s.state.NextArtifactID++
 		id = fmt.Sprintf("art-%d", s.state.NextArtifactID)
 	}
-	maxBytes := config.Scanner.ContextCompression.ArtifactMaxBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultArtifactIndexLimit * 8 * 1024
-	}
 	artifact := runtimeArtifact{
 		ID:            id,
 		Type:          kind,
@@ -382,10 +389,6 @@ func (s *scanSession) createArtifact(kind, toolName, path string, startLine, end
 		OriginalBytes: len(content),
 		CapturedAt:    time.Now(),
 		Content:       content,
-	}
-	if len(artifact.Content) > maxBytes {
-		artifact.Content = artifact.Content[:maxBytes] + "\n... (Artifact truncated) ..."
-		artifact.Truncated = true
 	}
 	data, err := json.MarshalIndent(artifact, "", "  ")
 	if err != nil {
@@ -399,6 +402,28 @@ func (s *scanSession) createArtifact(kind, toolName, path string, startLine, end
 		return runtimeArtifact{}, err
 	}
 	return artifact, nil
+}
+
+const toolTranscriptSafeBytes = 40 * 1024
+
+func prepareToolMessageForTranscript(session *scanSession, toolName, content, artifactID string) (string, string, error) {
+	if len(content) <= toolTranscriptSafeBytes {
+		return content, artifactID, nil
+	}
+
+	if artifactID == "" {
+		record, err := session.createArtifact("tool_output", toolName, "", 0, 0, content)
+		if err != nil {
+			return "", "", err
+		}
+		artifactID = record.ID
+	}
+
+	truncated := content[:toolTranscriptSafeBytes] + fmt.Sprintf(
+		"\n... (Tool output moved to artifact %s; use get_artifact to recover full content) ...",
+		artifactID,
+	)
+	return truncated, artifactID, nil
 }
 
 func (s *scanSession) loadArtifact(id string) (runtimeArtifact, bool) {
@@ -583,4 +608,18 @@ func selectResumableRuntimeStage(task *model.Task) (string, error) {
 		return 1
 	})
 	return candidates[0].stage, nil
+}
+
+func RuntimeStatus(task *model.Task, stage string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(task.StageRuntimePath(stage), runtimeStateFile))
+	if err != nil {
+		return "", err
+	}
+
+	var state runtimeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return "", err
+	}
+
+	return state.Status, nil
 }

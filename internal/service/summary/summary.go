@@ -81,8 +81,8 @@ var severityRank = map[string]int{
 	"MEDIUM":   3,
 	"LOW":      2,
 	"INFO":     1,
-	"NONE":     0,
 	"UNKNOWN":  0,
+	"NONE":     -1,
 }
 
 func BuildStats(tasks []model.Task) Stats {
@@ -269,6 +269,8 @@ func NormalizeSeverity(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
 	case "CRITICAL":
 		return "CRITICAL"
+	case "HIGH":
+		return "HIGH"
 	case "MEDIUM":
 		return "MEDIUM"
 	case "LOW":
@@ -276,7 +278,7 @@ func NormalizeSeverity(value string) string {
 	case "INFO":
 		return "INFO"
 	default:
-		return "HIGH"
+		return "UNKNOWN"
 	}
 }
 
@@ -342,7 +344,7 @@ func stageFindings(stage model.TaskStage) ([]map[string]any, bool, bool) {
 }
 
 func severityBreakdown(counts map[string]int) []SeverityCount {
-	order := []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+	order := []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"}
 	result := make([]SeverityCount, 0, len(order))
 	for _, label := range order {
 		if counts[label] == 0 {

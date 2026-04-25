@@ -65,6 +65,7 @@ type ReportStage struct {
 	FindingCount      int
 	RejectedCount     int
 	ZeroFindings      bool
+	AllRejected       bool
 	RawOnly           bool
 	RawResult         string
 	UniqueFiles       int
@@ -85,6 +86,7 @@ type ReportFinding struct {
 	Origin           string
 	Subtype          string
 	Description      string
+	LocationFile     string
 	Location         string
 	Trigger          string
 	TriggerParameter string

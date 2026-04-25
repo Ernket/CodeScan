@@ -27,6 +27,7 @@
 *.exe
 *.zip
 *.log
+*-report-*.html
 
 # Local analysis/design notes that should stay out of OSS repo
 /CONTEXT_COMPRESSION_IMPLEMENTATION.md

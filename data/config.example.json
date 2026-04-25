@@ -12,8 +12,21 @@
     "model": "gpt-5.4"
   },
   "scanner_config": {
-    "context_soft_limit_bytes": 90000,
-    "context_hard_limit_bytes": 140000,
-    "context_summary_window_messages": 12
+    "context_compression": {
+      "soft_limit_tokens": 40000,
+      "hard_limit_tokens": 200000
+    },
+    "session_memory": {
+      "enabled": true
+    }
+  },
+  "orchestration_config": {
+    "enabled": true,
+    "worker": {
+      "model": ""
+    },
+    "validator": {
+      "model": ""
+    }
   }
 }

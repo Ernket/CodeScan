@@ -36,10 +36,12 @@ func main() {
 	// 2. Load or Create Config
 	var cfg Config
 	if _, err := os.Stat(ConfigFile); err == nil {
-		data, err := os.ReadFile(ConfigFile)
-		if err == nil {
-			json.Unmarshal(data, &cfg)
+		loaded, err := config.LoadConfigFile(ConfigFile)
+		if err != nil {
+			fmt.Printf("Error loading config file %s: %v\n", ConfigFile, err)
+			return
 		}
+		cfg = loaded
 	}
 
 	// 3. Setup Auth Key
@@ -67,6 +69,7 @@ func main() {
 		cfg.DBConfig.DBName = "codescan"
 	}
 	cfg.ScannerConfig, _ = config.NormalizeScannerConfig(cfg.ScannerConfig)
+	cfg.OrchestrationConfig = config.NormalizeOrchestrationConfig(cfg.OrchestrationConfig)
 
 	// Save Config
 	data, _ := json.MarshalIndent(cfg, "", "  ")

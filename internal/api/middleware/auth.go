@@ -10,6 +10,9 @@ import (
 func AuthMiddleware(authKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if token == "" {
+			token = c.Query("token")
+		}
 		if token != authKey {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid Auth Key"})
 			return

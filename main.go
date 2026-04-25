@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"codescan/internal/api/router"
 	"codescan/internal/config"
 	"codescan/internal/database"
+	"codescan/internal/service/orchestration"
 )
 
 func main() {
@@ -24,12 +24,12 @@ func main() {
 	// Load Config
 	var cfg config.Config
 	if _, err := os.Stat(*configFile); err == nil {
-		data, err := os.ReadFile(*configFile)
-		if err == nil {
-			if err := json.Unmarshal(data, &cfg); err != nil {
-				fmt.Printf("Warning: Failed to parse config file: %v\n", err)
-			}
+		loaded, err := config.LoadConfigFile(*configFile)
+		if err != nil {
+			fmt.Printf("Error loading config file %s: %v\n", *configFile, err)
+			return
 		}
+		cfg = loaded
 	} else if *configFile != "data/config.json" {
 		fmt.Printf("Warning: Config file %s not found\n", *configFile)
 	}
@@ -74,10 +74,12 @@ func main() {
 	for _, warning := range scannerWarnings {
 		fmt.Printf("Warning: %s\n", warning)
 	}
+	cfg.OrchestrationConfig = config.NormalizeOrchestrationConfig(cfg.OrchestrationConfig)
 
 	// Expose AI config globally for scanner
 	config.AI = cfg.AIConfig
 	config.Scanner = cfg.ScannerConfig
+	config.Orchestration = cfg.OrchestrationConfig
 
 	if cfg.AuthKey == "" {
 		fmt.Println("Error: Auth Key not found. Please run 'go run cmd/init/main.go' first.")
@@ -88,6 +90,9 @@ func main() {
 	if err := database.InitDB(&cfg.DBConfig); err != nil {
 		fmt.Printf("Error connecting to database: %v\n", err)
 		return
+	}
+	if err := orchestration.DefaultManager().RecoverActiveRuns(); err != nil {
+		fmt.Printf("Warning: failed to recover orchestration runs: %v\n", err)
 	}
 
 	fmt.Println("==================================================")

@@ -38,6 +38,8 @@ var taskReportTemplate = template.Must(template.New("task_report").Funcs(templat
 			return "低危"
 		case "INFO":
 			return "提示"
+		case "UNKNOWN":
+			return "未知"
 		default:
 			return strings.TrimSpace(label)
 		}
@@ -358,6 +360,8 @@ const reportHTMLTemplate = `<!DOCTYPE html>
                 <pre>{{ .RawResult }}</pre>
               </div>
             </div>
+          {{ else if .AllRejected }}
+            <div class="state-note">{{ .SummaryText }}</div>
           {{ else if .ZeroFindings }}
             <div class="state-note">该阶段已执行完成，未发现已确认漏洞。本结果会保留在导出报告中，便于后续追踪与留档。</div>
           {{ else }}

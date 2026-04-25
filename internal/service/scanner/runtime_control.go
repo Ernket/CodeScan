@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"codescan/internal/config"
 	"codescan/internal/database"
 	"codescan/internal/model"
 
@@ -12,15 +13,15 @@ import (
 )
 
 func RunAIScan(task *model.Task, stage string) {
-	runAIScan(task, stage, StageRunInitial, false)
+	runAIScanAsync(task, stage, StageRunInitial, false, legacyScanExecutionOptions())
 }
 
 func RunGapCheck(task *model.Task, stage string) {
-	runAIScan(task, stage, StageRunGapCheck, false)
+	runAIScanAsync(task, stage, StageRunGapCheck, false, legacyScanExecutionOptions())
 }
 
 func RunRevalidate(task *model.Task, stage string) {
-	runAIScan(task, stage, StageRunRevalidate, false)
+	runAIScanAsync(task, stage, StageRunRevalidate, false, legacyScanExecutionOptions())
 }
 
 func ResumeAIScan(task *model.Task) (string, error) {
@@ -39,8 +40,30 @@ func ResumeAIScan(task *model.Task) (string, error) {
 			kind = stageRunKindFromMeta(current)
 		}
 	}
-	go runAIScan(task, stage, kind, true)
+	runAIScanAsync(task, stage, kind, true, legacyScanExecutionOptions())
 	return stage, nil
+}
+
+func ExecuteAIScan(task *model.Task, stage string, kind StageRunKind, resume bool, options ScanExecutionOptions) {
+	runAIScan(task, stage, kind, resume, options)
+}
+
+func OrchestratedExecutionOptions(stage string, kind StageRunKind) ScanExecutionOptions {
+	if stage == "init" {
+		return orchestratedInitExecutionOptions()
+	}
+	options := orchestratedStageExecutionOptions()
+	switch kind {
+	case StageRunInitial:
+		options.Profile.Model = config.Orchestration.Worker.Model
+	case StageRunRevalidate:
+		options.Profile.Model = config.Orchestration.Validator.Model
+	}
+	return options
+}
+
+func runAIScanAsync(task *model.Task, stage string, kind StageRunKind, resume bool, options ScanExecutionOptions) {
+	go runAIScan(task, stage, kind, resume, options)
 }
 
 func pauseRequested(taskID, stage string) bool {

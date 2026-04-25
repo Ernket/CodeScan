@@ -71,7 +71,16 @@ func EnsureDatabase(rootDB *gorm.DB, dbName string) (bool, error) {
 }
 
 func EnsureSchema(db *gorm.DB) ([]string, error) {
-	if err := db.AutoMigrate(&model.Task{}, &model.TaskStage{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.Task{},
+		&model.TaskStage{},
+		&model.TaskRun{},
+		&model.TaskSubtask{},
+		&model.TaskAgentRun{},
+		&model.TaskEvent{},
+		&model.TaskRoute{},
+		&model.TaskFinding{},
+	); err != nil {
 		return nil, fmt.Errorf("error auto-migrating database: %v", err)
 	}
 

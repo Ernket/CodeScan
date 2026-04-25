@@ -24,12 +24,10 @@ func useTestScannerConfig(t *testing.T) {
 	t.Helper()
 	config.Scanner, _ = config.NormalizeScannerConfig(config.ScannerConfig{
 		ContextCompression: config.ContextCompressionConfig{
-			Enabled:                true,
 			SoftLimitBytes:         2048,
 			HardLimitBytes:         4096,
 			SummaryWindowMessages:  8,
 			MicrocompactKeepRecent: 1,
-			ArtifactMaxBytes:       512,
 			CompactMinTailMessages: 2,
 			SessionMemoryEnabled:   true,
 		},
@@ -38,9 +36,6 @@ func useTestScannerConfig(t *testing.T) {
 			MinGrowthBytes:         1,
 			MinToolCalls:           1,
 			MaxUpdateBytes:         2048,
-			RequestTimeoutSeconds:  60,
-			MaxRetries:             3,
-			RetryBackoffSeconds:    2,
 			FailureCooldownSeconds: 300,
 		},
 	})

@@ -10,7 +10,7 @@ import (
 )
 
 func severityBreakdown(counts map[string]int) []SeverityCount {
-	order := []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+	order := []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"}
 	result := make([]SeverityCount, 0, len(order))
 	for _, label := range order {
 		if counts[label] == 0 {
@@ -25,19 +25,12 @@ func severityBreakdown(counts map[string]int) []SeverityCount {
 	return result
 }
 
-func normalizeSeverity(value string) string {
-	switch strings.ToUpper(strings.TrimSpace(value)) {
-	case "CRITICAL":
-		return "CRITICAL"
-	case "MEDIUM":
-		return "MEDIUM"
-	case "LOW":
-		return "LOW"
-	case "INFO":
-		return "INFO"
-	default:
-		return "HIGH"
+func locationFile(raw any) string {
+	location, ok := raw.(map[string]any)
+	if !ok || location == nil {
+		return ""
 	}
+	return strings.TrimSpace(extractString(location["file"]))
 }
 
 func formatLocation(raw any) string {

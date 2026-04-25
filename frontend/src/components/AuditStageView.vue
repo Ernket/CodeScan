@@ -1,6 +1,14 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { Activity, CheckCircle, LayoutDashboard, RefreshCw, Terminal } from 'lucide-vue-next'
+import {
+  effectiveSeverity,
+  formatLocation,
+  formatTriggerLabel,
+  normalizeSeverity,
+  splitFindings,
+  verificationStatus,
+} from '../utils/findings'
 
 const props = defineProps({
   task: {
@@ -86,8 +94,9 @@ const resultsMatchExpectedType = computed(() => {
   if (!normalizedResults.value.length) return true
   return normalizedResults.value[0]?.type === expectedType.value
 })
-const activeFindings = computed(() => normalizedResults.value.filter(item => verificationStatus(item) !== 'rejected'))
-const rejectedFindings = computed(() => normalizedResults.value.filter(item => verificationStatus(item) === 'rejected'))
+const findingGroups = computed(() => splitFindings(normalizedResults.value))
+const activeFindings = computed(() => findingGroups.value.active)
+const rejectedFindings = computed(() => findingGroups.value.rejected)
 const hasStructuredResults = computed(() => Array.isArray(props.results))
 const reviewSummary = computed(() => props.stageMeta?.review_summary || '')
 const reviewCounters = computed(() => {
@@ -99,43 +108,26 @@ const reviewCounters = computed(() => {
   return items.filter(item => item.value > 0)
 })
 
-function verificationStatus(item) {
-  const value = String(item?.verification_status || '').trim().toLowerCase()
-  if (value === 'confirmed' || value === 'uncertain' || value === 'rejected') return value
-  return 'unreviewed'
-}
-
 function displaySeverity(item) {
-  return normalizeSeverity(item?.reviewed_severity || item?.severity)
-}
-
-function normalizeSeverity(value) {
-  switch (String(value || '').trim().toUpperCase()) {
-    case 'CRITICAL':
-      return 'CRITICAL'
-    case 'MEDIUM':
-      return 'MEDIUM'
-    case 'LOW':
-      return 'LOW'
-    case 'INFO':
-      return 'INFO'
-    default:
-      return 'HIGH'
-  }
+  return effectiveSeverity(item)
 }
 
 function severityBadgeClass(severity) {
   switch (normalizeSeverity(severity)) {
     case 'CRITICAL':
       return 'bg-red-500/15 text-red-300 border border-red-500/30'
+    case 'HIGH':
+      return 'bg-orange-500/15 text-orange-300 border border-orange-500/30'
     case 'MEDIUM':
       return 'bg-yellow-500/15 text-yellow-300 border border-yellow-500/30'
     case 'LOW':
       return 'bg-blue-500/15 text-blue-300 border border-blue-500/30'
     case 'INFO':
       return 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
+    case 'UNKNOWN':
+      return 'bg-zinc-500/15 text-zinc-300 border border-zinc-500/30'
     default:
-      return 'bg-orange-500/15 text-orange-300 border border-orange-500/30'
+      return 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
   }
 }
 
@@ -162,17 +154,11 @@ function originBadgeClass(origin) {
 }
 
 function findingLocation(item) {
-  const file = item?.location?.file
-  const line = item?.location?.line
-  if (!file) return props.t('auditView.locationNotProvided')
-  return line ? `${file}:${line}` : file
+  return formatLocation(item?.location, props.t('auditView.locationNotProvided'))
 }
 
 function findingTrigger(item) {
-  const method = String(item?.trigger?.method || '').trim()
-  const path = String(item?.trigger?.path || '').trim()
-  const label = `${method} ${path}`.trim()
-  return label || props.t('auditView.staticFinding')
+  return formatTriggerLabel(item?.trigger, props.t('auditView.staticFinding'))
 }
 
 function displayVerification(status) {

@@ -52,8 +52,8 @@ func Build(task model.Task, generatedAt time.Time) (*TaskReport, error) {
 			cleanStageCount++
 		}
 		for _, finding := range reportStage.Findings {
-			if finding.Location != "" {
-				totalFiles[finding.Location] = struct{}{}
+			if finding.LocationFile != "" {
+				totalFiles[finding.LocationFile] = struct{}{}
 			}
 			if finding.Trigger != "" {
 				totalInterfaces[finding.Trigger] = struct{}{}
@@ -107,13 +107,12 @@ func buildStageReport(cfg stageConfig, stage model.TaskStage) (ReportStage, bool
 	rejectedFindings := summarysvc.RejectedFindings(findings)
 	stageReport.FindingCount = len(activeFindings)
 	stageReport.RejectedCount = len(rejectedFindings)
-	stageReport.ZeroFindings = len(activeFindings) == 0
-	if stageReport.ZeroFindings {
-		if stageReport.RejectedCount > 0 {
-			stageReport.SummaryText = "当前发现已在复核过程中全部被驳回。"
-		} else {
-			stageReport.SummaryText = "该阶段已完成，未发现已确认漏洞。"
-		}
+	stageReport.AllRejected = stageReport.FindingCount == 0 && stageReport.RejectedCount > 0
+	stageReport.ZeroFindings = stageReport.FindingCount == 0 && !stageReport.AllRejected
+	if stageReport.AllRejected {
+		stageReport.SummaryText = "当前发现已在复核过程中全部被驳回。"
+	} else if stageReport.ZeroFindings {
+		stageReport.SummaryText = "该阶段已完成，未发现已确认漏洞。"
 	} else {
 		stageReport.SummaryText = formatFindingSummary(len(activeFindings))
 	}
@@ -124,8 +123,8 @@ func buildStageReport(cfg stageConfig, stage model.TaskStage) (ReportStage, bool
 	for index, finding := range activeFindings {
 		reportFinding := buildFindingReport(cfg, finding, index)
 		stageReport.Findings = append(stageReport.Findings, reportFinding)
-		if reportFinding.Location != "" {
-			files[reportFinding.Location] = struct{}{}
+		if reportFinding.LocationFile != "" {
+			files[reportFinding.LocationFile] = struct{}{}
 		}
 		if reportFinding.Trigger != "" {
 			interfaces[reportFinding.Trigger] = struct{}{}
@@ -155,22 +154,23 @@ func buildFindingReport(cfg stageConfig, finding map[string]any, index int) Repo
 		Origin:           strings.TrimSpace(summarysvc.ExtractString(finding["origin"])),
 		Subtype:          fallbackString(summarysvc.ExtractString(finding["subtype"]), cfg.Label),
 		Description:      fallbackString(summarysvc.ExtractString(finding["description"]), "暂无描述。"),
+		LocationFile:     locationFile(finding["location"]),
 		Location:         formatLocation(finding["location"]),
 		Trigger:          trigger,
 		TriggerParameter: triggerParameter,
 	}
 
 	usedKeys := map[string]bool{
-		"type":        true,
-		"subtype":     true,
-		"description": true,
-		"severity":    true,
+		"type":                true,
+		"subtype":             true,
+		"description":         true,
+		"severity":            true,
 		"reviewed_severity":   true,
 		"verification_status": true,
 		"verification_reason": true,
 		"origin":              true,
-		"location":    true,
-		"trigger":     true,
+		"location":            true,
+		"trigger":             true,
 	}
 
 	addDetail := func(label, value string, code bool) {

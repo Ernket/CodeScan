@@ -2,11 +2,15 @@ package scanner
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/sashabaranov/go-openai"
@@ -75,6 +79,102 @@ var Tools = []openai.Tool{
 					},
 				},
 				Required: []string{"artifact_id"},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name:        "query_manifest",
+			Description: "Query the lightweight project manifest for module roots, route candidate files, and stage hotspots.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"stage": {
+						Type:        jsonschema.String,
+						Description: "Optional stage filter such as init, rce, auth, or logic.",
+					},
+					"module": {
+						Type:        jsonschema.String,
+						Description: "Optional module root filter from the manifest.",
+					},
+					"rule_name": {
+						Type:        jsonschema.String,
+						Description: "Optional rule name filter.",
+					},
+					"offset": {
+						Type:        jsonschema.Integer,
+						Description: "Skip the first N manifest hits (optional).",
+					},
+					"limit": {
+						Type:        jsonschema.Integer,
+						Description: "Maximum number of hits to return (optional).",
+					},
+				},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name:        "query_routes",
+			Description: "Query the structured route inventory without injecting the full route JSON into the prompt.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"source": {
+						Type:        jsonschema.String,
+						Description: "Optional source file substring filter.",
+					},
+					"path": {
+						Type:        jsonschema.String,
+						Description: "Optional route path substring filter.",
+					},
+					"method": {
+						Type:        jsonschema.String,
+						Description: "Optional HTTP method filter.",
+					},
+					"offset": {
+						Type:        jsonschema.Integer,
+						Description: "Skip the first N routes (optional).",
+					},
+					"limit": {
+						Type:        jsonschema.Integer,
+						Description: "Maximum number of routes to return (optional).",
+					},
+				},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name:        "query_stage_output",
+			Description: "Query structured findings from the current stage or another completed stage without injecting the full findings JSON into the prompt.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"stage": {
+						Type:        jsonschema.String,
+						Description: "Optional stage name. Defaults to the current stage when omitted.",
+					},
+					"origin": {
+						Type:        jsonschema.String,
+						Description: "Optional origin filter such as initial or gap_check.",
+					},
+					"verification_status": {
+						Type:        jsonschema.String,
+						Description: "Optional verification status filter such as confirmed, uncertain, rejected, or unreviewed.",
+					},
+					"offset": {
+						Type:        jsonschema.Integer,
+						Description: "Skip the first N findings (optional).",
+					},
+					"limit": {
+						Type:        jsonschema.Integer,
+						Description: "Maximum number of findings to return (optional).",
+					},
+				},
 			},
 		},
 	},
@@ -204,12 +304,21 @@ const (
 	defaultReadMaxLines         = 200
 	defaultGrepMaxResults       = 200
 	defaultSearchMaxResults     = 200
-	defaultListMaxEntries       = 300
-	defaultTreeMaxEntries       = 500
+	defaultListMaxEntries       = 1000
+	defaultTreeMaxEntries       = 1500
 	maxGrepFileBytes            = 2 * 1024 * 1024
 )
 
 var stopWalk = errors.New("stop")
+
+type rgCommandResult struct {
+	stdout   []byte
+	stderr   []byte
+	exitCode int
+	err      error
+}
+
+var runRGCommand = defaultRunRGCommand
 
 var skipDirNames = map[string]struct{}{
 	".git":         {},
@@ -318,6 +427,8 @@ func ExecuteReadFile(path string, startLine, endLine int, maxOutputBytes int) st
 	for scanner.Scan() {
 		currentLine++
 		if currentLine >= startLine {
+			sb.WriteString(strconv.Itoa(currentLine))
+			sb.WriteString(": ")
 			sb.WriteString(scanner.Text())
 			sb.WriteString("\n")
 		}
@@ -355,38 +466,46 @@ func ExecuteListFiles(path string, maxEntries int) string {
 		maxEntries = defaultListMaxEntries
 	}
 
-	var sb strings.Builder
-	count := 0
+	lines := make([]string, 0, len(files))
+	totalEntries := 0
+	truncated := false
+	currentBytes := 0
 	for _, f := range files {
 		info, _ := f.Info()
 		if shouldSkipDir(info) {
 			continue
 		}
+		totalEntries++
 		prefix := "F"
 		if f.IsDir() {
 			prefix = "D"
 		}
-		sb.WriteString(fmt.Sprintf("[%s] %s (%d bytes)\n", prefix, f.Name(), info.Size()))
-		count++
-		if maxEntries > 0 && count >= maxEntries {
-			sb.WriteString("... (List truncated) ...\n")
-			break
+		line := fmt.Sprintf("[%s] %s (%d bytes)", prefix, f.Name(), info.Size())
+		if len(lines) >= maxEntries || currentBytes+len(line)+1 > defaultListMaxOutputBytes {
+			truncated = true
+			continue
 		}
-		if sb.Len() > defaultListMaxOutputBytes {
-			sb.WriteString("... (Output truncated) ...\n")
-			break
-		}
+		lines = append(lines, line)
+		currentBytes += len(line) + 1
 	}
-	if sb.Len() == 0 {
+	if totalEntries == 0 {
 		return "Directory is empty."
 	}
-	return sb.String()
+	body := strings.Join(lines, "\n")
+	if truncated {
+		if body != "" {
+			body += "\n"
+		}
+		body += fmt.Sprintf("TRUNCATED: true\nRETURNED_ENTRIES: %d\nTOTAL_ENTRIES: %d", len(lines), totalEntries)
+	}
+	return body
 }
 
 func ExecuteListDirTree(path string, maxDepth int, maxEntries int) string {
 	var sb strings.Builder
 	rootDepth := strings.Count(filepath.Clean(path), string(os.PathSeparator))
 	count := 0
+	truncated := false
 
 	if maxEntries <= 0 {
 		maxEntries = defaultTreeMaxEntries
@@ -416,29 +535,35 @@ func ExecuteListDirTree(path string, maxDepth int, maxEntries int) string {
 		if info.IsDir() {
 			prefix = "D"
 		}
-		sb.WriteString(fmt.Sprintf("%s[%s] %s\n", indent, prefix, info.Name()))
+		line := fmt.Sprintf("%s[%s] %s\n", indent, prefix, info.Name())
+		if count >= maxEntries || sb.Len()+len(line) > defaultListMaxOutputBytes {
+			truncated = true
+			return stopWalk
+		}
+		sb.WriteString(line)
 		count++
-		if maxEntries > 0 && count >= maxEntries {
-			sb.WriteString("... (Tree truncated) ...\n")
-			return stopWalk
-		}
-		if sb.Len() > defaultListMaxOutputBytes {
-			sb.WriteString("... (Output truncated) ...\n")
-			return stopWalk
-		}
 		return nil
 	})
 
 	if err != nil && !errors.Is(err, stopWalk) {
 		return fmt.Sprintf("Error walking directory: %v", err)
 	}
-	return sb.String()
+	body := strings.TrimRight(sb.String(), "\n")
+	if body == "" {
+		body = "."
+	}
+	if truncated {
+		body += fmt.Sprintf("\nTRUNCATED: true\nRETURNED_ENTRIES: %d\nMAX_ENTRIES: %d", count, maxEntries)
+	}
+	return body
 }
 
 func ExecuteSearchFiles(path string, pattern string, maxResults int, offset int) string {
-	var matches []string
 	if maxResults <= 0 {
 		maxResults = defaultSearchMaxResults
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	if os.PathSeparator != '/' {
 		pattern = strings.ReplaceAll(pattern, "/", string(os.PathSeparator))
@@ -448,6 +573,11 @@ func ExecuteSearchFiles(path string, pattern string, maxResults int, offset int)
 		pattern = strings.TrimPrefix(pattern, prefix)
 	}
 	hasDir := strings.Contains(pattern, string(os.PathSeparator))
+	var sb strings.Builder
+	scannedFiles := 0
+	matchedResults := 0
+	returnedResults := 0
+	truncated := false
 
 	err := filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -455,6 +585,9 @@ func ExecuteSearchFiles(path string, pattern string, maxResults int, offset int)
 		}
 		if shouldSkipDir(info) {
 			return filepath.SkipDir
+		}
+		if !info.IsDir() {
+			scannedFiles++
 		}
 
 		var nameToMatch string
@@ -475,36 +608,197 @@ func ExecuteSearchFiles(path string, pattern string, maxResults int, offset int)
 
 		if match {
 			relPath, _ := filepath.Rel(path, p)
-			matches = append(matches, relPath)
-			if maxResults > 0 && len(matches) >= maxResults+offset {
-				return stopWalk
+			matchedResults++
+			if matchedResults <= offset {
+				return nil
 			}
+			if returnedResults >= maxResults {
+				truncated = true
+				return nil
+			}
+			line := filepath.ToSlash(relPath)
+			if sb.Len()+len(line)+1 > defaultSearchMaxOutputBytes {
+				truncated = true
+				return nil
+			}
+			sb.WriteString(line)
+			sb.WriteString("\n")
+			returnedResults++
 		}
 		return nil
 	})
 
-	if err != nil && !errors.Is(err, stopWalk) {
+	if err != nil {
 		return fmt.Sprintf("Error searching files: %v", err)
 	}
-	if len(matches) == 0 {
-		return "No matching files found."
+	body := strings.TrimRight(sb.String(), "\n")
+	if body == "" {
+		body = "No matching files found."
 	}
-	if offset > 0 && offset < len(matches) {
-		matches = matches[offset:]
-	} else if offset >= len(matches) {
-		return "No matching files found."
+	nextOffset := -1
+	if truncated {
+		nextOffset = offset + returnedResults
 	}
-	if maxResults > 0 && len(matches) > maxResults {
-		matches = matches[:maxResults]
-	}
-	result := strings.Join(matches, "\n")
-	if len(result) > defaultSearchMaxOutputBytes {
-		return result[:defaultSearchMaxOutputBytes] + "\n... (Output truncated) ..."
-	}
-	return result
+	return appendPaginationFooter(body, truncated, nextOffset, scannedFiles, matchedResults)
 }
 
 func ExecuteGrepFiles(path string, pattern string, caseInsensitive bool, maxResults int, offset int, maxFiles int, maxOutputBytes int) string {
+	if maxResults <= 0 {
+		maxResults = defaultGrepMaxResults
+	}
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = defaultGrepMaxOutputBytes
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	files, scannedFiles, filesTruncated, err := collectGrepCandidates(path, maxFiles)
+	if err != nil {
+		return fmt.Sprintf("Error walking directory: %v", err)
+	}
+
+	if result, ok := executeGrepFilesWithRG(path, files, scannedFiles, filesTruncated, pattern, caseInsensitive, maxResults, offset, maxOutputBytes); ok {
+		return result
+	}
+	return executeGrepFilesFallback(files, scannedFiles, filesTruncated, pattern, caseInsensitive, maxResults, offset, maxOutputBytes)
+}
+
+type grepCandidate struct {
+	absPath string
+	relPath string
+}
+
+func collectGrepCandidates(root string, maxFiles int) ([]grepCandidate, int, bool, error) {
+	candidates := []grepCandidate{}
+	scannedFiles := 0
+	truncated := false
+
+	err := filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			if shouldSkipDir(info) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if maxFiles > 0 && scannedFiles >= maxFiles {
+			truncated = true
+			return stopWalk
+		}
+		scannedFiles++
+
+		if info.Size() > maxGrepFileBytes {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(p))
+		if ext == ".exe" || ext == ".dll" || ext == ".bin" || ext == ".git" {
+			return nil
+		}
+		if strings.Contains(p, ".git"+string(os.PathSeparator)) {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		candidates = append(candidates, grepCandidate{
+			absPath: p,
+			relPath: filepath.ToSlash(relPath),
+		})
+		return nil
+	})
+	if err != nil && !errors.Is(err, stopWalk) {
+		return nil, 0, false, err
+	}
+	return candidates, scannedFiles, truncated, nil
+}
+
+func executeGrepFilesWithRG(path string, files []grepCandidate, scannedFiles int, filesTruncated bool, pattern string, caseInsensitive bool, maxResults int, offset int, maxOutputBytes int) (string, bool) {
+	type rgEvent struct {
+		Type string `json:"type"`
+		Data struct {
+			Path struct {
+				Text string `json:"text"`
+			} `json:"path"`
+			Lines struct {
+				Text string `json:"text"`
+			} `json:"lines"`
+			LineNumber int `json:"line_number"`
+		} `json:"data"`
+	}
+
+	var sb strings.Builder
+	matchedCount := 0
+	writtenCount := 0
+	truncated := filesTruncated
+	if len(files) == 0 {
+		return formatGrepResult("", truncated, offset, writtenCount, scannedFiles, matchedCount), true
+	}
+	batches := chunkGrepCandidates(files)
+
+	for _, batch := range batches {
+		args := []string{"--json", "--line-number", "--color", "never", "--no-ignore", "--hidden"}
+		if caseInsensitive {
+			args = append(args, "-i")
+		}
+		args = append(args, "--", pattern)
+		for _, file := range batch {
+			args = append(args, file.relPath)
+		}
+
+		result := runRGCommand(path, args)
+		switch {
+		case result.err == nil:
+		case result.exitCode == 1:
+			continue
+		default:
+			return "", false
+		}
+
+		scanner := bufio.NewScanner(bytes.NewReader(result.stdout))
+		lineBuf := make([]byte, 0, 64*1024)
+		scanner.Buffer(lineBuf, 1024*1024)
+		for scanner.Scan() {
+			var event rgEvent
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				return "", false
+			}
+			if event.Type != "match" {
+				continue
+			}
+			matchedCount++
+			if matchedCount <= offset {
+				continue
+			}
+			if writtenCount >= maxResults {
+				truncated = true
+				continue
+			}
+			displayLine := strings.TrimSpace(event.Data.Lines.Text)
+			if len(displayLine) > 100 {
+				displayLine = displayLine[:100] + "..."
+			}
+			resultLine := fmt.Sprintf("%s:%d: %s\n", filepath.ToSlash(event.Data.Path.Text), event.Data.LineNumber, displayLine)
+			if sb.Len()+len(resultLine) > maxOutputBytes {
+				truncated = true
+				continue
+			}
+			sb.WriteString(resultLine)
+			writtenCount++
+		}
+		if err := scanner.Err(); err != nil {
+			return "", false
+		}
+	}
+
+	return formatGrepResult(sb.String(), truncated, offset, writtenCount, scannedFiles, matchedCount), true
+}
+
+func executeGrepFilesFallback(files []grepCandidate, scannedFiles int, filesTruncated bool, pattern string, caseInsensitive bool, maxResults int, offset int, maxOutputBytes int) string {
 	var sb strings.Builder
 	prefix := ""
 	if caseInsensitive {
@@ -516,54 +810,15 @@ func ExecuteGrepFiles(path string, pattern string, caseInsensitive bool, maxResu
 		return fmt.Sprintf("Invalid regex pattern: %v", err)
 	}
 
-	if maxResults <= 0 {
-		maxResults = defaultGrepMaxResults
-	}
-	if maxFiles <= 0 {
-		maxFiles = 1000
-	}
-	if maxOutputBytes <= 0 {
-		maxOutputBytes = defaultGrepMaxOutputBytes
-	}
-
 	matchedCount := 0
 	writtenCount := 0
-	scannedFiles := 0
-
-	err = filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
+	truncated := filesTruncated
+	for _, file := range files {
+		content, err := os.ReadFile(file.absPath)
 		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			if shouldSkipDir(info) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		scannedFiles++
-		if scannedFiles > maxFiles {
-			sb.WriteString("... (File scan limit reached) ...\n")
-			return stopWalk
+			continue
 		}
 
-		if info.Size() > maxGrepFileBytes {
-			return nil
-		}
-
-		ext := strings.ToLower(filepath.Ext(p))
-		if ext == ".exe" || ext == ".dll" || ext == ".bin" || ext == ".git" {
-			return nil
-		}
-		if strings.Contains(p, ".git"+string(os.PathSeparator)) {
-			return nil
-		}
-
-		content, err := os.ReadFile(p)
-		if err != nil {
-			return nil
-		}
-
-		// Use bufio.Scanner for line-by-line matching to reduce memory allocation
 		lineNum := 0
 		lineScanner := bufio.NewScanner(strings.NewReader(string(content)))
 		lineBuf := make([]byte, 0, 64*1024)
@@ -571,37 +826,118 @@ func ExecuteGrepFiles(path string, pattern string, caseInsensitive bool, maxResu
 		for lineScanner.Scan() {
 			lineNum++
 			line := lineScanner.Text()
-			if re.MatchString(line) {
-				matchedCount++
-				if matchedCount <= offset {
-					continue
-				}
-				relPath, _ := filepath.Rel(path, p)
-				displayLine := strings.TrimSpace(line)
-				if len(displayLine) > 100 {
-					displayLine = displayLine[:100] + "..."
-				}
-				sb.WriteString(fmt.Sprintf("%s:%d: %s\n", relPath, lineNum, displayLine))
-				writtenCount++
-				if writtenCount >= maxResults {
-					sb.WriteString("... (Results truncated) ...\n")
-					return stopWalk
-				}
-				if sb.Len() > maxOutputBytes {
-					sb.WriteString("... (Output truncated) ...\n")
-					return stopWalk
-				}
+			if !re.MatchString(line) {
+				continue
 			}
+			matchedCount++
+			if matchedCount <= offset {
+				continue
+			}
+			if writtenCount >= maxResults {
+				truncated = true
+				continue
+			}
+			displayLine := strings.TrimSpace(line)
+			if len(displayLine) > 100 {
+				displayLine = displayLine[:100] + "..."
+			}
+			resultLine := fmt.Sprintf("%s:%d: %s\n", file.relPath, lineNum, displayLine)
+			if sb.Len()+len(resultLine) > maxOutputBytes {
+				truncated = true
+				continue
+			}
+			sb.WriteString(resultLine)
+			writtenCount++
 		}
-		return nil
-	})
+	}
 
-	if err != nil && !errors.Is(err, stopWalk) {
-		return fmt.Sprintf("Error walking directory: %v", err)
+	return formatGrepResult(sb.String(), truncated, offset, writtenCount, scannedFiles, matchedCount)
+}
+
+func chunkGrepCandidates(files []grepCandidate) [][]grepCandidate {
+	if len(files) == 0 {
+		return nil
 	}
-	result := sb.String()
-	if result == "" {
-		return "No matches found."
+
+	const (
+		maxChunkFiles = 256
+		maxChunkBytes = 24 * 1024
+	)
+
+	chunks := [][]grepCandidate{}
+	current := make([]grepCandidate, 0, maxChunkFiles)
+	currentBytes := 0
+	for _, file := range files {
+		fileBytes := len(file.relPath) + 1
+		if len(current) > 0 && (len(current) >= maxChunkFiles || currentBytes+fileBytes > maxChunkBytes) {
+			chunks = append(chunks, current)
+			current = make([]grepCandidate, 0, maxChunkFiles)
+			currentBytes = 0
+		}
+		current = append(current, file)
+		currentBytes += fileBytes
 	}
-	return result
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
+}
+
+func formatGrepResult(body string, truncated bool, offset int, writtenCount int, scannedFiles int, matchedCount int) string {
+	body = strings.TrimRight(body, "\n")
+	if body == "" {
+		body = "No matches found."
+	}
+	nextOffset := -1
+	if truncated {
+		nextOffset = offset + writtenCount
+	}
+	return appendPaginationFooter(body, truncated, nextOffset, scannedFiles, matchedCount)
+}
+
+func defaultRunRGCommand(dir string, args []string) rgCommandResult {
+	rgPath, err := exec.LookPath("rg")
+	if err != nil {
+		return rgCommandResult{err: err}
+	}
+
+	cmd := exec.Command(rgPath, args...)
+	cmd.Dir = dir
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err = cmd.Run()
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+
+	return rgCommandResult{
+		stdout:   stdout.Bytes(),
+		stderr:   stderr.Bytes(),
+		exitCode: exitCode,
+		err:      err,
+	}
+}
+
+func appendPaginationFooter(body string, truncated bool, nextOffset, scannedFiles, matchedResults int) string {
+	if body == "" {
+		body = "No matches found."
+	}
+	return fmt.Sprintf(
+		"%s\nTRUNCATED: %t\nNEXT_OFFSET: %d\nSCANNED_FILES: %d\nMATCHED_RESULTS: %d",
+		body,
+		truncated,
+		nextOffset,
+		scannedFiles,
+		matchedResults,
+	)
 }

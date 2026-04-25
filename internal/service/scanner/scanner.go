@@ -140,6 +140,39 @@ func extractJSON(input string) string {
 	return input
 }
 
+func hasTokenUsage(usage openai.Usage) bool {
+	return usage.PromptTokens > 0 ||
+		usage.CompletionTokens > 0 ||
+		usage.TotalTokens > 0 ||
+		usage.PromptTokensDetails != nil ||
+		usage.CompletionTokensDetails != nil
+}
+
+func formatTokenUsageLog(usage openai.Usage, softLimitTokens, hardLimitTokens int) string {
+	parts := []string{
+		fmt.Sprintf("prompt=%d", usage.PromptTokens),
+		fmt.Sprintf("completion=%d", usage.CompletionTokens),
+		fmt.Sprintf("total=%d", usage.TotalTokens),
+	}
+	if usage.PromptTokensDetails != nil && usage.PromptTokensDetails.CachedTokens > 0 {
+		parts = append(parts, fmt.Sprintf("cached=%d", usage.PromptTokensDetails.CachedTokens))
+	}
+	if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
+		parts = append(parts, fmt.Sprintf("reasoning=%d", usage.CompletionTokensDetails.ReasoningTokens))
+	}
+	if softLimitTokens > 0 {
+		pressure := "safe"
+		switch {
+		case hardLimitTokens > 0 && usage.PromptTokens >= hardLimitTokens:
+			pressure = "hard"
+		case usage.PromptTokens >= softLimitTokens:
+			pressure = "soft"
+		}
+		parts = append(parts, "pressure="+pressure)
+	}
+	return "AI token usage (API): " + strings.Join(parts, ", ")
+}
+
 func calculateContextBytes(messages []openai.ChatCompletionMessage) int {
 	total := 0
 	for _, msg := range messages {
@@ -522,7 +555,16 @@ func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.To
 }
 
 func createChatCompletion(ctx context.Context, client *openai.Client, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, bool, error) {
-	resp, receivedChunk, err := createChatCompletionStream(ctx, client, req)
+	streamReq := req
+	if streamReq.StreamOptions == nil {
+		streamReq.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
+	} else if !streamReq.StreamOptions.IncludeUsage {
+		opts := *streamReq.StreamOptions
+		opts.IncludeUsage = true
+		streamReq.StreamOptions = &opts
+	}
+
+	resp, receivedChunk, err := createChatCompletionStream(ctx, client, streamReq)
 	if err == nil {
 		return resp, receivedChunk, nil
 	}
@@ -1338,14 +1380,22 @@ RAW_DATA>>>>
 	return extractJSON(result), nil
 }
 
-func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
+func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool, options ScanExecutionOptions) {
 	// Panic Recovery
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("CRITICAL PANIC in runAIScan: %v\n", r)
-			task.Status = "failed"
 			task.Result = fmt.Sprintf("Internal Server Error (Panic): %v", r)
-			saveTaskRecord(task)
+			if options.ManageTaskStatus {
+				task.Status = "failed"
+			}
+			if options.PersistTaskRecord {
+				if options.ManageTaskStatus {
+					saveTaskRecord(task)
+				} else {
+					saveTaskProjection(task)
+				}
+			}
 		}
 	}()
 
@@ -1392,8 +1442,10 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 		// silently fails to write []string to a JSON column.
 		if currentStage != nil {
 			saveTaskStageRecord(currentStage)
-		} else {
+		} else if options.PersistTaskRecord && options.ManageTaskStatus {
 			saveTaskRecord(task)
+		} else if options.PersistTaskRecord {
+			saveTaskProjection(task)
 		}
 		pendingLogs = 0
 		lastFlushTime = time.Now()
@@ -1426,8 +1478,21 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 		}
 	}
 
-	task.Status = "running"
-	updateTaskStatus(task, "running")
+	persistTaskRecord := func() {
+		if !options.PersistTaskRecord {
+			return
+		}
+		if options.ManageTaskStatus {
+			saveTaskRecord(task)
+			return
+		}
+		saveTaskProjection(task)
+	}
+
+	if options.ManageTaskStatus {
+		task.Status = "running"
+		updateTaskStatus(task, "running")
+	}
 
 	if resume {
 		logFunc("Task resumed. Restoring AI runtime...")
@@ -1438,16 +1503,27 @@ func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool) {
 	defer func() {
 		// Flush any pending logs and final save
 		flushLogs()
-		saveTaskRecord(task)
+		persistTaskRecord()
 		if currentStage != nil {
 			saveTaskStageRecord(currentStage)
 		}
 	}()
 
 	client := aiClientFactory()
-	toolCache := map[string]string{}
-	toolCacheOrder := []string{}
-	maxToolCacheEntries := 200
+	toolCache := newToolResultCache(maxToolCacheEntries, maxToolCacheBytes)
+	executionProfile := options.Profile
+	executionProfile.Model = executionProfile.modelOrDefault()
+	manifest, manifestErr := EnsureProjectManifest(task)
+	if manifestErr != nil {
+		logFunc(fmt.Sprintf("Project manifest unavailable: %v", manifestErr))
+	} else {
+		logFunc(fmt.Sprintf(
+			"Project manifest ready: %d languages, %d modules, %d route candidates.",
+			len(manifest.Languages),
+			len(manifest.ModuleRoots),
+			len(manifest.RouteCandidateFiles),
+		))
+	}
 
 	// --- PROMPT SELECTION ---
 	var prompt string
@@ -1515,10 +1591,7 @@ Output Format:
 	} else if stage == "rce" {
 		// Load previous stage result (Route Map)
 		// We use task.OutputJSON which contains the structured route list from the 'init' stage.
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 2: RCE (Remote Code Execution) Deep Audit.
 Your goal is to find Remote Code Execution vulnerabilities, specifically focusing on command injection, code injection, and unsafe deserialization.
@@ -1585,10 +1658,7 @@ Base Path: %s
 		// --- 阶段三：注入类漏洞深度审计 ---
 
 		// 1. 获取上下文（复用路由表）
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		// 2. 构造 Prompt
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 3: Injection Vulnerability Deep Audit.
@@ -1657,10 +1727,7 @@ Base Path: %s
   **CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "auth" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 5: Authentication and Session Security Audit.
 Your goal is to find confirmed authentication and session security vulnerabilities.
@@ -1753,10 +1820,7 @@ Base Path: %s
 	**CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "access" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 6: Authorization and Access Control Audit.
 Your goal is to find confirmed authorization and access control vulnerabilities, including IDOR-style flaws, broken role checks, privilege escalation paths, and missing function-level access control.
@@ -1856,10 +1920,7 @@ Base Path: %s
   **CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "xss" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 4: XSS (Cross-Site Scripting) Comprehensive Audit.
 Your goal is to find confirmed Reflected XSS, Stored XSS, and DOM XSS vulnerabilities.
@@ -1948,10 +2009,7 @@ Base Path: %s
   **CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "config" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 7: Configuration and Component Security Audit.
 Your goal is to find confirmed vulnerabilities caused by insecure configuration, unsafe defaults, sensitive information exposure, unsafe framework/component settings, and vulnerable third-party components.
@@ -2050,10 +2108,7 @@ Base Path: %s
    **CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "fileop" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 8: File Operation Security Audit.
 Your goal is to find confirmed file operation vulnerabilities, including arbitrary file upload, arbitrary file download/read, path traversal, and file inclusion.
@@ -2148,10 +2203,7 @@ Base Path: %s
   **CRITICAL**: Do NOT include any conversational text, explanations, or summaries in your final response. Output ONLY the JSON code block.
 `, task.BasePath, routesContext)
 	} else if stage == "logic" {
-		routesContext := "[]"
-		if len(task.OutputJSON) > 0 && string(task.OutputJSON) != "{}" {
-			routesContext = string(task.OutputJSON)
-		}
+		routesContext := BuildKnownRoutesContext(task, manifest)
 
 		prompt = fmt.Sprintf(`You are a Professional Security Auditor performing Phase 9: Business Logic Vulnerability Audit.
 Your goal is to find confirmed business logic vulnerabilities, including workflow bypasses, race conditions, amount or quantity tampering, and business rule bypasses.
@@ -2263,9 +2315,11 @@ Base Path: %s
 	prompt, promptErr := adaptPromptForRunKind(prompt, task, stage, currentStage, kind)
 	if promptErr != nil {
 		failMessage := "Prompt preparation failed: " + promptErr.Error()
-		task.Status = "failed"
 		task.Result = failMessage
-		saveTaskRecord(task)
+		if options.ManageTaskStatus {
+			task.Status = "failed"
+		}
+		persistTaskRecord()
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = failMessage
@@ -2276,6 +2330,7 @@ Base Path: %s
 	}
 	prompt = appendChineseNarrativeRules(prompt, stage)
 	prompt = promptArtifactGuidance(prompt)
+	prompt = appendStructuredQueryGuidance(prompt, stage)
 
 	var session *scanSession
 	var err error
@@ -2285,9 +2340,11 @@ Base Path: %s
 		session, err = newScanSession(task, stage, prompt, true)
 	}
 	if err != nil {
-		task.Status = "failed"
 		task.Result = "Runtime initialization failed: " + err.Error()
-		saveTaskRecord(task)
+		if options.ManageTaskStatus {
+			task.Status = "failed"
+		}
+		persistTaskRecord()
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = task.Result
@@ -2297,9 +2354,11 @@ Base Path: %s
 		return
 	}
 	if err := session.markStatus(runtimeStatusRunning); err != nil {
-		task.Status = "failed"
 		task.Result = "Runtime initialization failed: " + err.Error()
-		saveTaskRecord(task)
+		if options.ManageTaskStatus {
+			task.Status = "failed"
+		}
+		persistTaskRecord()
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = task.Result
@@ -2314,9 +2373,11 @@ Base Path: %s
 
 	failRun := func(prefix string, runErr error) {
 		message := prefix + runErr.Error()
-		task.Status = "failed"
 		task.Result = message
-		saveTaskRecord(task)
+		if options.ManageTaskStatus {
+			task.Status = "failed"
+		}
+		persistTaskRecord()
 		if currentStage != nil {
 			currentStage.Status = "failed"
 			currentStage.Result = message
@@ -2328,18 +2389,25 @@ Base Path: %s
 
 	// Chat Loop
 	const maxIterations = 200
+	softLimitTokens := config.Scanner.ContextCompression.SoftLimitTokens
+	hardLimitTokens := config.Scanner.ContextCompression.HardLimitTokens
 	softLimitBytes := config.Scanner.ContextCompression.SoftLimitBytes
 	hardLimitBytes := config.Scanner.ContextCompression.HardLimitBytes
 	logFunc(fmt.Sprintf(
-		"Context limits configured: soft=%d bytes, hard=%d bytes, summary_window=%d messages.",
+		"Context policy configured: API prompt soft=%d tokens, hard=%d tokens; byte fallback soft=%d, hard=%d; summary_window=%d messages.",
+		softLimitTokens,
+		hardLimitTokens,
 		softLimitBytes,
 		hardLimitBytes,
 		config.Scanner.ContextCompression.SummaryWindowMessages,
 	))
+	usageUnavailableLogged := false
 	for i := 0; i < maxIterations; i++ {
 		if pauseRequested(task.ID, stage) {
-			task.Status = "paused"
-			updateTaskStatus(task, "paused")
+			if options.ManageTaskStatus {
+				task.Status = "paused"
+				updateTaskStatus(task, "paused")
+			}
 			if currentStage != nil {
 				currentStage.Status = "paused"
 				saveTaskStageRecord(currentStage)
@@ -2377,7 +2445,7 @@ Base Path: %s
 		flushLogs()
 
 		resp, callErr = createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
-			Model:    config.AI.Model,
+			Model:    executionProfile.Model,
 			Messages: messages,
 			Tools:    Tools,
 		}, chatCompletionRetryHooks{
@@ -2423,6 +2491,13 @@ Base Path: %s
 			failRun(errPrefix, callErr)
 			return
 		}
+		if hasTokenUsage(resp.Usage) {
+			logFunc(formatTokenUsageLog(resp.Usage, softLimitTokens, hardLimitTokens))
+			usageUnavailableLogged = false
+		} else if !usageUnavailableLogged {
+			logFunc("AI API did not return token usage for this request. Context control will fall back to byte-based limits when needed.")
+			usageUnavailableLogged = true
+		}
 
 		msg := resp.Choices[0].Message
 		if err := session.appendChatMessage(msg); err != nil {
@@ -2437,7 +2512,9 @@ Base Path: %s
 		if len(msg.ToolCalls) == 0 {
 			session.maybeUpdateSessionMemory(ctx, client, logFunc)
 			_ = session.markStatus(runtimeStatusCompleted)
-			task.Status = "completed"
+			if options.ManageTaskStatus {
+				task.Status = "completed"
+			}
 			outputJSON, meta, finalizeErr := finalizeRunOutput(task, stage, currentStage, kind, msg.Content)
 			if finalizeErr != nil {
 				failRun("Result processing error: ", finalizeErr)
@@ -2456,195 +2533,34 @@ Base Path: %s
 				task.OutputJSON = outputJSON
 			}
 
-			saveTaskRecord(task)
+			persistTaskRecord()
 			logFunc("Analysis completed.")
 			return
 		}
 
-		for _, toolCall := range msg.ToolCalls {
-			var toolResult string
-			var artifactID string
-			toolName := toolCall.Function.Name
-			var args map[string]interface{}
-			startTs := time.Now().UnixMilli()
+		_, toolErr := executeToolRound(toolPlanningContext{
+			task:         task,
+			currentStage: currentStage,
+			session:      session,
+			toolCache:    toolCache,
+		}, msg.ToolCalls, logFunc)
+		if toolErr != nil {
+			failRun("Runtime error: ", toolErr)
+			return
+		}
 
-			argStr := strings.TrimSpace(toolCall.Function.Arguments)
-			if !strings.HasPrefix(argStr, "{") {
-				if idx := strings.Index(argStr, "{"); idx != -1 {
-					argStr = argStr[idx:]
-				}
-			}
-			if !strings.HasSuffix(argStr, "}") {
-				if idx := strings.LastIndex(argStr, "}"); idx != -1 {
-					argStr = argStr[:idx+1]
-				}
-			}
-
-			if err := json.Unmarshal([]byte(argStr), &args); err != nil {
-				toolResult = fmt.Sprintf("Error parsing JSON arguments: %v", err)
-			} else {
-				cacheKey := toolName + "|" + argStr
-				if cached, ok := toolCache[cacheKey]; ok {
-					toolResult = cached
-					logFunc(fmt.Sprintf("Tool cache hit: %s (%s)", toolName, argStr))
-				} else {
-					logFunc(fmt.Sprintf("Executing tool: %s (%s)", toolName, argStr))
-					switch toolName {
-					case "read_file":
-						path := GetStringArg(args, "path")
-						startLine := int(GetFloatArg(args, "start_line"))
-						endLine := int(GetFloatArg(args, "end_line"))
-						maxOutputBytes := int(GetFloatArg(args, "max_output_bytes"))
-						resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-						if resolveErr != nil {
-							toolResult = resolveErr.Error()
-						} else {
-							toolResult = ExecuteReadFile(resolvedPath, startLine, endLine, maxOutputBytes)
-						}
-
-					case "get_evidence":
-						evidenceID := GetStringArg(args, "evidence_id")
-						if evidenceID == "" {
-							toolResult = "Error: evidence_id is required"
-							break
-						}
-						record, ok := session.loadArtifact(evidenceID)
-						if !ok {
-							toolResult = fmt.Sprintf("Error: evidence_id %q not found in the current run.", evidenceID)
-							break
-						}
-						toolResult = formatArtifactPayload(record)
-
-					case "get_artifact":
-						artifactIDArg := GetStringArg(args, "artifact_id")
-						if artifactIDArg == "" {
-							toolResult = "Error: artifact_id is required"
-							break
-						}
-						record, ok := session.loadArtifact(artifactIDArg)
-						if !ok {
-							toolResult = fmt.Sprintf("Error: artifact_id %q not found in the current run.", artifactIDArg)
-							break
-						}
-						toolResult = formatArtifactPayload(record)
-
-					case "list_files":
-						path := GetStringArg(args, "path")
-						maxEntries := int(GetFloatArg(args, "max_entries"))
-						resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-						if resolveErr != nil {
-							toolResult = resolveErr.Error()
-						} else {
-							toolResult = ExecuteListFiles(resolvedPath, maxEntries)
-						}
-
-					case "list_dir_tree":
-						path := GetStringArg(args, "path")
-						maxDepth := int(GetFloatArg(args, "max_depth"))
-						if maxDepth == 0 {
-							maxDepth = 2
-						}
-						maxEntries := int(GetFloatArg(args, "max_entries"))
-						resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-						if resolveErr != nil {
-							toolResult = resolveErr.Error()
-						} else {
-							toolResult = ExecuteListDirTree(resolvedPath, maxDepth, maxEntries)
-						}
-
-					case "search_files":
-						path := GetStringArg(args, "path")
-						pattern := GetStringArg(args, "pattern")
-						maxResults := int(GetFloatArg(args, "max_results"))
-						offset := int(GetFloatArg(args, "offset"))
-						resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-						if resolveErr != nil {
-							toolResult = resolveErr.Error()
-						} else {
-							toolResult = ExecuteSearchFiles(resolvedPath, pattern, maxResults, offset)
-						}
-
-					case "grep_files":
-						path := GetStringArg(args, "path")
-						pattern := GetStringArg(args, "pattern")
-						caseInsensitive := false
-						if v, ok := args["case_insensitive"]; ok {
-							if b, ok := v.(bool); ok {
-								caseInsensitive = b
-							}
-						}
-						maxResults := int(GetFloatArg(args, "max_results"))
-						offset := int(GetFloatArg(args, "offset"))
-						maxFiles := int(GetFloatArg(args, "max_files"))
-						maxOutputBytes := int(GetFloatArg(args, "max_output_bytes"))
-						resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-						if resolveErr != nil {
-							toolResult = resolveErr.Error()
-						} else {
-							toolResult = ExecuteGrepFiles(resolvedPath, pattern, caseInsensitive, maxResults, offset, maxFiles, maxOutputBytes)
-						}
-
-					default:
-						toolResult = fmt.Sprintf("Error: Unknown tool %s", toolName)
-					}
-					if _, ok := toolCache[cacheKey]; !ok {
-						toolCache[cacheKey] = toolResult
-						toolCacheOrder = append(toolCacheOrder, cacheKey)
-						if len(toolCacheOrder) > maxToolCacheEntries {
-							oldest := toolCacheOrder[0]
-							toolCacheOrder = toolCacheOrder[1:]
-							delete(toolCache, oldest)
-						}
-					}
-				}
-
-				if toolName == "read_file" && isSuccessfulReadResult(toolResult) {
-					path := GetStringArg(args, "path")
-					startLine := int(GetFloatArg(args, "start_line"))
-					endLine := int(GetFloatArg(args, "end_line"))
-					resolvedPath, resolveErr := resolveToolPath(task.BasePath, path)
-					if resolveErr == nil {
-						effectiveStartLine, effectiveEndLine := normalizeReadFileRange(startLine, endLine)
-						record, recordErr := session.createArtifact(
-							"read_file",
-							toolName,
-							displayToolPath(task.BasePath, resolvedPath),
-							effectiveStartLine,
-							effectiveEndLine,
-							toolResult,
-						)
-						if recordErr == nil {
-							artifactID = record.ID
-							logFunc(fmt.Sprintf("Preserved read_file artifact %s for %s (%s).", record.ID, record.Path, formatLineRange(record.StartLine, record.EndLine)))
-						}
-					}
-				}
-			}
-
-			elapsed := time.Now().UnixMilli() - startTs
-			logFunc(fmt.Sprintf("Tool %s finished in %d ms, output %d bytes", toolName, elapsed, len(toolResult)))
-
-			maxToolContent := 40000
-			toolContent := toolResult
-			if len(toolResult) > maxToolContent {
-				toolContent = toolResult[:maxToolContent] + "\n... (Tool output truncated) ..."
-			}
-			if err := session.appendToolMessage(toolCall.ID, toolName, toolContent, artifactID); err != nil {
-				failRun("Runtime error: ", err)
-				return
-			}
-
-			if pauseRequested(task.ID, stage) {
+		if pauseRequested(task.ID, stage) {
+			if options.ManageTaskStatus {
 				task.Status = "paused"
 				updateTaskStatus(task, "paused")
-				if currentStage != nil {
-					currentStage.Status = "paused"
-					saveTaskStageRecord(currentStage)
-				}
-				_ = session.markStatus(runtimeStatusPaused)
-				logFunc("Pause requested. Runtime state saved.")
-				return
 			}
+			if currentStage != nil {
+				currentStage.Status = "paused"
+				saveTaskStageRecord(currentStage)
+			}
+			_ = session.markStatus(runtimeStatusPaused)
+			logFunc("Pause requested. Runtime state saved.")
+			return
 		}
 
 		session.maybeUpdateSessionMemory(ctx, client, logFunc)
@@ -2653,6 +2569,43 @@ Base Path: %s
 		messages = make([]openai.ChatCompletionMessage, 0, len(entries))
 		for _, entry := range entries {
 			messages = append(messages, entry.Chat)
+		}
+
+		promptTokensLowerBound := resp.Usage.PromptTokens
+		if hasTokenUsage(resp.Usage) {
+			if hardLimitTokens > 0 && promptTokensLowerBound >= hardLimitTokens {
+				logFunc(fmt.Sprintf(
+					"API-reported prompt tokens already reached %d (hard=%d). Compressing context before the next request.",
+					promptTokensLowerBound,
+					hardLimitTokens,
+				))
+				if err := session.compressHistory(ctx, client, logFunc); err != nil {
+					failRun("Compression error: ", err)
+					return
+				}
+				continue
+			}
+			if softLimitTokens > 0 && promptTokensLowerBound >= softLimitTokens {
+				originalBytes, updatedBytes, changed, truncateErr := session.truncateLastToolMessage(20000)
+				if truncateErr != nil {
+					failRun("Runtime error: ", truncateErr)
+					return
+				}
+				if changed {
+					logFunc(fmt.Sprintf(
+						"API-reported prompt tokens reached %d (soft=%d). Proactively truncated the latest tool output from %d to %d bytes before the next request.",
+						promptTokensLowerBound,
+						softLimitTokens,
+						originalBytes,
+						updatedBytes,
+					))
+					entries = session.buildChatEntries()
+					messages = make([]openai.ChatCompletionMessage, 0, len(entries))
+					for _, entry := range entries {
+						messages = append(messages, entry.Chat)
+					}
+				}
+			}
 		}
 
 		totalBytes := calculateContextBytes(messages)
@@ -2708,7 +2661,9 @@ Base Path: %s
 	}
 
 	_ = session.markStatus(runtimeStatusCompleted)
-	task.Status = "completed"
+	if options.ManageTaskStatus {
+		task.Status = "completed"
+	}
 	activeEntries := session.buildChatEntries()
 	lastContent := ""
 	if len(activeEntries) > 0 {
@@ -2734,6 +2689,6 @@ Base Path: %s
 		task.OutputJSON = outputJSON
 	}
 
-	saveTaskRecord(task)
+	persistTaskRecord()
 	logFunc("Analysis finished (limit reached).")
 }

@@ -64,25 +64,41 @@ func adaptPromptForRunKind(
 		if err != nil {
 			return "", err
 		}
-		existingJSON, err := marshalIndented(existing)
-		if err != nil {
-			return "", err
-		}
-		extra := fmt.Sprintf(`
+		if stage == "init" {
+			manifest, _ := EnsureProjectManifest(task)
+			extra := fmt.Sprintf(`
 
 SUPPLEMENTAL GAP-CHECK MODE:
-- The JSON array below is the current stored result for this stage.
+- The summary below describes the current stored route inventory for this stage.
 - You MUST re-review the codebase to find omissions, alternate code paths, overlooked sinks, overlooked route handlers, overlooked boundary cases, and duplicate implementations that were missed in the current result.
 - Keep every still-valid existing item.
 - Add only newly confirmed items.
 - If two items describe the same root issue, keep a single merged item.
-- For non-init stages, include an "origin" field on each item using either "initial" or "gap_check".
+- Use query_routes to inspect the current structured route inventory before merging.
 - Do NOT add conversational text.
 - Final output MUST be the COMPLETE merged JSON array for this stage, not just the delta.
 
-<current_stage_result>
+<current_stage_result_summary>
 %s
-</current_stage_result>`, existingJSON)
+</current_stage_result_summary>`, BuildKnownRoutesContext(task, manifest))
+			return basePrompt + extra, nil
+		}
+		extra := fmt.Sprintf(`
+
+SUPPLEMENTAL GAP-CHECK MODE:
+- The summary below describes the current stored findings for this stage.
+- You MUST re-review the codebase to find omissions, alternate code paths, overlooked sinks, overlooked route handlers, overlooked boundary cases, and duplicate implementations that were missed in the current result.
+- Keep every still-valid existing item.
+- Add only newly confirmed items.
+- If two items describe the same root issue, keep a single merged item.
+- Include an "origin" field on each item using either "initial" or "gap_check".
+- Use query_stage_output to inspect the current structured findings before merging.
+- Do NOT add conversational text.
+- Final output MUST be the COMPLETE merged JSON array for this stage, not just the delta.
+
+<current_stage_result_summary>
+%s
+</current_stage_result_summary>`, BuildCurrentFindingsContext(stage, existing))
 		return basePrompt + extra, nil
 	case StageRunRevalidate:
 		if stage == "init" {
@@ -92,15 +108,7 @@ SUPPLEMENTAL GAP-CHECK MODE:
 		if err != nil {
 			return "", err
 		}
-		existingJSON, err := marshalIndented(existing)
-		if err != nil {
-			return "", err
-		}
-		routes, _ := summarysvc.ParseJSONArray(task.OutputJSON, task.Result)
-		routesJSON, err := marshalIndented(routes)
-		if err != nil {
-			return "", err
-		}
+		manifest, _ := EnsureProjectManifest(task)
 		return fmt.Sprintf(`You are a senior security review engineer performing a static revalidation pass for the %s stage.
 Your job is to verify the CURRENT findings only. Do not invent new findings.
 
@@ -110,9 +118,9 @@ Base Path: %s
 %s
 </known_routes_context>
 
-<current_findings>
+<current_findings_summary>
 %s
-</current_findings>
+</current_findings_summary>
 
 Rules:
 1. Re-read the codebase using the provided tools and validate each current finding against actual code evidence.
@@ -126,7 +134,8 @@ Rules:
 6. Use "uncertain" when some evidence exists but exploitability, reachability, or impact is not fully established.
 7. Use "rejected" for false positives, duplicates, schema mismatches, or claims not supported by code.
 8. Only adjust severity through "reviewed_severity". Keep the original "severity" field unchanged.
-9. Final output MUST be the full JSON array with the same findings and the new review fields. Return JSON only.`, summarysvc.StageLabel(stage), task.BasePath, routesJSON, existingJSON), nil
+9. Use query_routes for exact route subsets and query_stage_output for exact current findings while re-reading code.
+10. Final output MUST be the full JSON array with the same findings and the new review fields. Return JSON only.`, summarysvc.StageLabel(stage), task.BasePath, BuildKnownRoutesContext(task, manifest), BuildCurrentFindingsContext(stage, existing)), nil
 	default:
 		return basePrompt, nil
 	}
@@ -157,21 +166,13 @@ func finalizeRunOutput(
 	kind StageRunKind,
 	content string,
 ) (json.RawMessage, model.TaskStageMeta, error) {
-	jsonPart := extractJSON(content)
-	if !json.Valid([]byte(jsonPart)) {
-		if kind == StageRunInitial {
-			return json.RawMessage("[]"), model.TaskStageMeta{LastRunKind: string(kind)}, nil
-		}
-		return nil, model.TaskStageMeta{}, fmt.Errorf("AI output is not valid JSON")
-	}
-
 	if stage == "init" {
 		if kind == StageRunRevalidate {
 			return nil, model.TaskStageMeta{}, fmt.Errorf("route inventory does not support revalidation")
 		}
-		routes, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
-		if !ok {
-			return nil, model.TaskStageMeta{}, fmt.Errorf("route inventory result is not a JSON array")
+		routes, err := parseJSONArrayOutputWithRepair(content, stage)
+		if err != nil {
+			return nil, model.TaskStageMeta{}, err
 		}
 		if kind == StageRunGapCheck {
 			existing, err := currentJSONArrayForRun(task, currentStage, stage)
@@ -194,25 +195,25 @@ func finalizeRunOutput(
 
 	switch kind {
 	case StageRunInitial:
-		next, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
-		if !ok {
-			return nil, model.TaskStageMeta{}, fmt.Errorf("stage %q result is not a JSON array", stage)
+		next, err := parseJSONArrayOutputWithRepair(content, stage)
+		if err != nil {
+			return nil, model.TaskStageMeta{}, err
 		}
 		next = normalizeInitialFindings(stage, next)
 		blob, err := marshalRaw(next)
 		return blob, model.TaskStageMeta{LastRunKind: string(kind)}, err
 	case StageRunGapCheck:
-		candidates, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
-		if !ok {
-			return nil, model.TaskStageMeta{}, fmt.Errorf("gap check output for %q is not a JSON array", stage)
+		candidates, err := parseJSONArrayOutputWithRepair(content, stage)
+		if err != nil {
+			return nil, model.TaskStageMeta{}, err
 		}
 		final, meta := mergeGapCheckFindings(stage, existing, candidates)
 		blob, err := marshalRaw(final)
 		return blob, meta, err
 	case StageRunRevalidate:
-		reviewed, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
-		if !ok {
-			return nil, model.TaskStageMeta{}, fmt.Errorf("revalidation output for %q is not a JSON array", stage)
+		reviewed, err := parseJSONArrayOutputWithRepair(content, stage)
+		if err != nil {
+			return nil, model.TaskStageMeta{}, err
 		}
 		final, meta := applyRevalidationFindings(stage, existing, reviewed)
 		blob, err := marshalRaw(final)
@@ -220,6 +221,35 @@ func finalizeRunOutput(
 	default:
 		return nil, model.TaskStageMeta{}, fmt.Errorf("unsupported run kind %q", kind)
 	}
+}
+
+func parseJSONArrayOutputWithRepair(content string, stage string) ([]map[string]any, error) {
+	parse := func(raw string) ([]map[string]any, error) {
+		jsonPart := extractJSON(raw)
+		if !json.Valid([]byte(jsonPart)) {
+			return nil, fmt.Errorf("AI output is not valid JSON")
+		}
+		items, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
+		if !ok {
+			return nil, fmt.Errorf("AI output is not a JSON array")
+		}
+		return items, nil
+	}
+
+	items, err := parse(content)
+	if err == nil {
+		return items, nil
+	}
+
+	repaired, repairErr := RepairJSON(content, stage)
+	if repairErr != nil {
+		return nil, err
+	}
+	items, repairedErr := parse(repaired)
+	if repairedErr != nil {
+		return nil, repairedErr
+	}
+	return items, nil
 }
 
 func normalizeInitialFindings(stage string, findings []map[string]any) []map[string]any {

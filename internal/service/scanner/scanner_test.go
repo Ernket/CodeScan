@@ -622,6 +622,75 @@ func TestChatCompletionStreamAccumulatorMergesToolCalls(t *testing.T) {
 	}
 }
 
+func TestCreateChatCompletionWithRetryRequestsStreamUsageAndPreservesIt(t *testing.T) {
+	useTestAIRequestPolicy(t, 1)
+
+	sawIncludeUsage := false
+	client := newTestAIClient(testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		if !requestUsesStream(t, req) {
+			t.Fatal("expected streaming request")
+		}
+
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		sawIncludeUsage = strings.Contains(string(body), `"include_usage":true`) || strings.Contains(string(body), `"include_usage": true`)
+
+		return newChatCompletionStreamResponse(
+			t,
+			openai.ChatCompletionStreamResponse{
+				ID:                "chatcmpl-stream-usage",
+				Object:            "chat.completion.chunk",
+				Created:           123,
+				Model:             "gpt-4o-mini",
+				SystemFingerprint: "fp-test",
+				Choices: []openai.ChatCompletionStreamChoice{
+					{
+						Index: 0,
+						Delta: openai.ChatCompletionStreamChoiceDelta{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "usage-aware",
+						},
+						FinishReason: openai.FinishReasonStop,
+					},
+				},
+			},
+			openai.ChatCompletionStreamResponse{
+				ID:      "chatcmpl-stream-usage",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o-mini",
+				Choices: []openai.ChatCompletionStreamChoice{},
+				Usage: &openai.Usage{
+					PromptTokens:     11,
+					CompletionTokens: 3,
+					TotalTokens:      14,
+				},
+			},
+		), nil
+	}))
+
+	resp, err := createChatCompletionWithRetry(context.Background(), client, openai.ChatCompletionRequest{
+		Model: "gpt-4o-mini",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}, chatCompletionRetryHooks{})
+	if err != nil {
+		t.Fatalf("create chat completion with retry: %v", err)
+	}
+	if !sawIncludeUsage {
+		t.Fatal("expected stream request to include stream_options.include_usage=true")
+	}
+	if len(resp.Choices) != 1 || resp.Choices[0].Message.Content != "usage-aware" {
+		t.Fatalf("expected streamed content to be preserved, got %+v", resp.Choices)
+	}
+	if resp.Usage.PromptTokens != 11 || resp.Usage.CompletionTokens != 3 || resp.Usage.TotalTokens != 14 {
+		t.Fatalf("expected streamed usage to be preserved, got %+v", resp.Usage)
+	}
+}
+
 func TestCreateChatCompletionWithRetryFallsBackToNonStreamWhenStreamingUnsupported(t *testing.T) {
 	useTestAIRequestPolicy(t, 3)
 

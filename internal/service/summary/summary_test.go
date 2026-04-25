@@ -152,6 +152,67 @@ func TestBuildTaskListItemMarksRawOnlyStagesUnknown(t *testing.T) {
 	}
 }
 
+func TestBuildTaskListItemMarksActiveUnknownSeverity(t *testing.T) {
+	item := BuildTaskListItem(model.Task{
+		ID:        "task-5",
+		Status:    "completed",
+		CreatedAt: time.Date(2026, 3, 31, 14, 0, 0, 0, time.UTC),
+		Stages: []model.TaskStage{
+			{
+				Name:       "auth",
+				Status:     "completed",
+				OutputJSON: json.RawMessage(`[{"type":"Authentication","severity":"mystery"}]`),
+			},
+		},
+	})
+
+	if item.FindingCount != 1 {
+		t.Fatalf("expected 1 finding, got %d", item.FindingCount)
+	}
+	if item.HighestSeverity != "UNKNOWN" {
+		t.Fatalf("expected highest severity UNKNOWN, got %s", item.HighestSeverity)
+	}
+}
+
+func TestBuildStatsIncludesUnknownSeverityBreakdown(t *testing.T) {
+	stats := BuildStats([]model.Task{
+		{
+			ID:        "task-6",
+			Status:    "completed",
+			CreatedAt: time.Date(2026, 3, 31, 15, 0, 0, 0, time.UTC),
+			Stages: []model.TaskStage{
+				{
+					Name:   "logic",
+					Status: "completed",
+					OutputJSON: json.RawMessage(`[
+						{"type":"BusinessLogic","severity":"info"},
+						{"type":"BusinessLogic","severity":"mystery"}
+					]`),
+				},
+			},
+		},
+	})
+
+	if len(stats.SeverityBreakdown) != 2 {
+		t.Fatalf("expected 2 severity buckets, got %+v", stats.SeverityBreakdown)
+	}
+	if stats.SeverityBreakdown[0].Label != "INFO" || stats.SeverityBreakdown[0].Count != 1 {
+		t.Fatalf("expected INFO bucket first, got %+v", stats.SeverityBreakdown)
+	}
+	if stats.SeverityBreakdown[1].Label != "UNKNOWN" || stats.SeverityBreakdown[1].Count != 1 {
+		t.Fatalf("expected UNKNOWN bucket after INFO, got %+v", stats.SeverityBreakdown)
+	}
+}
+
+func TestNormalizeSeverityReturnsUnknownForMissingOrUnexpectedValues(t *testing.T) {
+	cases := []string{"", "mystery", "  "}
+	for _, input := range cases {
+		if got := NormalizeSeverity(input); got != "UNKNOWN" {
+			t.Fatalf("expected UNKNOWN for %q, got %s", input, got)
+		}
+	}
+}
+
 func TestParseFindingsAndRouteCountSupportFallbackJSON(t *testing.T) {
 	findings, rawOnly, ok := ParseFindings(nil, "prefix ```json\n[{\"severity\":\"low\"}]\n``` suffix")
 	if !ok {

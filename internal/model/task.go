@@ -43,6 +43,10 @@ func (t *Task) RuntimeRootPath() string {
 	return filepath.Join(t.GetBasePath(), ".codescan", "runtime")
 }
 
+func (t *Task) ProjectManifestPath() string {
+	return filepath.Join(t.RuntimeRootPath(), "project_manifest.json")
+}
+
 func (t *Task) StageRuntimePath(stage string) string {
 	return filepath.Join(t.RuntimeRootPath(), stage)
 }

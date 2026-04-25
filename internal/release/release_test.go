@@ -16,6 +16,7 @@ func TestCollectReleaseFilesExcludesLocalArtifacts(t *testing.T) {
 	mustWriteFile(t, root, "frontend/node_modules/app.js", "console.log('ignore')")
 	mustWriteFile(t, root, "frontend/.cache/tmp.txt", "ignore")
 	mustWriteFile(t, root, "release/out.zip", "ignore")
+	mustWriteFile(t, root, "demo-report-20260425.html", "<html>ignore</html>")
 
 	files, err := CollectReleaseFiles(root)
 	if err != nil {
@@ -33,6 +34,7 @@ func TestCollectReleaseFilesExcludesLocalArtifacts(t *testing.T) {
 	assertNotContains(t, got, "frontend/node_modules/app.js")
 	assertNotContains(t, got, "frontend/.cache/tmp.txt")
 	assertNotContains(t, got, "release/out.zip")
+	assertNotContains(t, got, "demo-report-20260425.html")
 }
 
 func TestScanFilesFlagsSecrets(t *testing.T) {
@@ -61,6 +63,26 @@ func TestScanFilesFlagsSecrets(t *testing.T) {
 		if !rules[rule] {
 			t.Fatalf("expected finding for %s, got %+v", rule, findings)
 		}
+	}
+}
+
+func TestScanFilesIgnoresPlaceholderValues(t *testing.T) {
+	root := t.TempDir()
+
+	mustWriteFile(t, root, "README.md", "{\n  \"auth_key\": \"...\"\n}\n")
+	mustWriteFile(t, root, "internal/config/config_test.go", "{\n  \"auth_key\": \"token\",\n  \"password\": \"secret\",\n  \"api_key\": \"k\"\n}\n")
+
+	files, err := CollectReleaseFiles(root)
+	if err != nil {
+		t.Fatalf("CollectReleaseFiles() error = %v", err)
+	}
+
+	findings, err := ScanFiles(files)
+	if err != nil {
+		t.Fatalf("ScanFiles() error = %v", err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("expected placeholder values to be ignored, got %+v", findings)
 	}
 }
 

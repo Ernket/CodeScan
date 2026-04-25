@@ -1,5 +1,7 @@
 package config
 
+import "encoding/json"
+
 const ProjectsDir = "projects"
 
 type DBConfig struct {
@@ -17,54 +19,103 @@ type AIConfig struct {
 }
 
 type ContextCompressionConfig struct {
-	Enabled                bool `json:"enabled"`
-	SoftLimitBytes         int  `json:"soft_limit_bytes"`
-	HardLimitBytes         int  `json:"hard_limit_bytes"`
-	SummaryWindowMessages  int  `json:"summary_window_messages"`
-	MicrocompactKeepRecent int  `json:"microcompact_keep_recent_rounds"`
-	ArtifactMaxBytes       int  `json:"artifact_max_bytes"`
-	CompactMinTailMessages int  `json:"compact_min_tail_messages"`
-	SessionMemoryEnabled   bool `json:"session_memory_enabled"`
+	SoftLimitTokens        int  `json:"soft_limit_tokens"`
+	HardLimitTokens        int  `json:"hard_limit_tokens"`
+	SoftLimitBytes         int  `json:"-"`
+	HardLimitBytes         int  `json:"-"`
+	SummaryWindowMessages  int  `json:"-"`
+	MicrocompactKeepRecent int  `json:"-"`
+	CompactMinTailMessages int  `json:"-"`
+	SessionMemoryEnabled   bool `json:"-"`
 }
 
 type SessionMemoryConfig struct {
 	Enabled                bool `json:"enabled"`
-	MinGrowthBytes         int  `json:"min_growth_bytes"`
-	MinToolCalls           int  `json:"min_tool_calls"`
-	MaxUpdateBytes         int  `json:"max_update_bytes"`
-	RequestTimeoutSeconds  int  `json:"request_timeout_seconds"`
-	MaxRetries             int  `json:"max_retries"`
-	RetryBackoffSeconds    int  `json:"retry_backoff_seconds"`
-	FailureCooldownSeconds int  `json:"failure_cooldown_seconds"`
+	MinGrowthBytes         int  `json:"-"`
+	MinToolCalls           int  `json:"-"`
+	MaxUpdateBytes         int  `json:"-"`
+	FailureCooldownSeconds int  `json:"-"`
+
+	enabledSet bool
 }
 
 type ScannerConfig struct {
-	ContextSoftLimitBytes        int                      `json:"context_soft_limit_bytes"`
-	ContextHardLimitBytes        int                      `json:"context_hard_limit_bytes"`
-	ContextSummaryWindowMessages int                      `json:"context_summary_window_messages"`
-	ContextCompression           ContextCompressionConfig `json:"context_compression"`
-	SessionMemory                SessionMemoryConfig      `json:"session_memory"`
+	ContextCompression ContextCompressionConfig `json:"context_compression"`
+	SessionMemory      SessionMemoryConfig      `json:"session_memory"`
+}
+
+type ParallelRoleConfig struct {
+	Parallelism int `json:"-"`
+}
+
+type ModelRoleConfig struct {
+	Model       string `json:"model"`
+	Parallelism int    `json:"-"`
+}
+
+type OrchestrationConfig struct {
+	Enabled             bool               `json:"enabled"`
+	SSEHeartbeatSeconds int                `json:"-"`
+	Planner             ParallelRoleConfig `json:"-"`
+	Worker              ModelRoleConfig    `json:"worker"`
+	Integrator          ParallelRoleConfig `json:"-"`
+	Validator           ModelRoleConfig    `json:"validator"`
+	Persistence         ParallelRoleConfig `json:"-"`
+
+	enabledSet bool
 }
 
 type Config struct {
-	AuthKey       string        `json:"auth_key"`
-	DBConfig      DBConfig      `json:"db_config"`
-	AIConfig      AIConfig      `json:"ai_config"`
-	ScannerConfig ScannerConfig `json:"scanner_config"`
+	AuthKey             string              `json:"auth_key"`
+	DBConfig            DBConfig            `json:"db_config"`
+	AIConfig            AIConfig            `json:"ai_config"`
+	ScannerConfig       ScannerConfig       `json:"scanner_config"`
+	OrchestrationConfig OrchestrationConfig `json:"orchestration_config"`
+}
+
+func (c *SessionMemoryConfig) UnmarshalJSON(data []byte) error {
+	type alias SessionMemoryConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*c = SessionMemoryConfig(decoded)
+	_, c.enabledSet = raw["enabled"]
+	return nil
+}
+
+func (c *OrchestrationConfig) UnmarshalJSON(data []byte) error {
+	type alias OrchestrationConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*c = OrchestrationConfig(decoded)
+	_, c.enabledSet = raw["enabled"]
+	return nil
 }
 
 func DefaultScannerConfig() ScannerConfig {
 	return ScannerConfig{
-		ContextSoftLimitBytes:        90000,
-		ContextHardLimitBytes:        140000,
-		ContextSummaryWindowMessages: 12,
 		ContextCompression: ContextCompressionConfig{
-			Enabled:                true,
+			SoftLimitTokens:        22000,
+			HardLimitTokens:        34000,
 			SoftLimitBytes:         90000,
 			HardLimitBytes:         140000,
 			SummaryWindowMessages:  12,
 			MicrocompactKeepRecent: 2,
-			ArtifactMaxBytes:       64 * 1024,
 			CompactMinTailMessages: 4,
 			SessionMemoryEnabled:   true,
 		},
@@ -73,9 +124,6 @@ func DefaultScannerConfig() ScannerConfig {
 			MinGrowthBytes:         24 * 1024,
 			MinToolCalls:           4,
 			MaxUpdateBytes:         32 * 1024,
-			RequestTimeoutSeconds:  180,
-			MaxRetries:             3,
-			RetryBackoffSeconds:    2,
 			FailureCooldownSeconds: 300,
 		},
 	}
@@ -84,49 +132,28 @@ func DefaultScannerConfig() ScannerConfig {
 func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	defaults := DefaultScannerConfig()
 	warnings := []string{}
-	originalContextCompression := cfg.ContextCompression
-	originalSessionMemory := cfg.SessionMemory
 
-	if cfg.ContextSoftLimitBytes <= 0 {
-		cfg.ContextSoftLimitBytes = defaults.ContextSoftLimitBytes
+	if cfg.ContextCompression.SoftLimitTokens <= 0 {
+		cfg.ContextCompression.SoftLimitTokens = defaults.ContextCompression.SoftLimitTokens
 	}
-	if cfg.ContextHardLimitBytes <= 0 {
-		cfg.ContextHardLimitBytes = defaults.ContextHardLimitBytes
+	if cfg.ContextCompression.HardLimitTokens <= 0 {
+		cfg.ContextCompression.HardLimitTokens = defaults.ContextCompression.HardLimitTokens
 	}
-	if cfg.ContextSummaryWindowMessages <= 0 {
-		cfg.ContextSummaryWindowMessages = defaults.ContextSummaryWindowMessages
-	}
-	if cfg.ContextHardLimitBytes <= cfg.ContextSoftLimitBytes {
-		cfg.ContextHardLimitBytes = defaults.ContextHardLimitBytes
-		if cfg.ContextHardLimitBytes <= cfg.ContextSoftLimitBytes {
-			cfg.ContextHardLimitBytes = cfg.ContextSoftLimitBytes + 1
+	if cfg.ContextCompression.HardLimitTokens <= cfg.ContextCompression.SoftLimitTokens {
+		cfg.ContextCompression.HardLimitTokens = defaults.ContextCompression.HardLimitTokens
+		if cfg.ContextCompression.HardLimitTokens <= cfg.ContextCompression.SoftLimitTokens {
+			cfg.ContextCompression.HardLimitTokens = cfg.ContextCompression.SoftLimitTokens + 1
 		}
-		warnings = append(warnings, "scanner_config.context_hard_limit_bytes must be greater than context_soft_limit_bytes; falling back to a safe hard limit")
-	}
-
-	if !cfg.ContextCompression.Enabled && originalContextCompression == (ContextCompressionConfig{}) {
-		cfg.ContextCompression.Enabled = defaults.ContextCompression.Enabled
+		warnings = append(warnings, "scanner_config.context_compression.hard_limit_tokens must be greater than soft_limit_tokens; falling back to a safe hard limit")
 	}
 	if cfg.ContextCompression.SoftLimitBytes <= 0 {
-		if cfg.ContextSoftLimitBytes > 0 {
-			cfg.ContextCompression.SoftLimitBytes = cfg.ContextSoftLimitBytes
-		} else {
-			cfg.ContextCompression.SoftLimitBytes = defaults.ContextCompression.SoftLimitBytes
-		}
+		cfg.ContextCompression.SoftLimitBytes = defaults.ContextCompression.SoftLimitBytes
 	}
 	if cfg.ContextCompression.HardLimitBytes <= 0 {
-		if cfg.ContextHardLimitBytes > 0 {
-			cfg.ContextCompression.HardLimitBytes = cfg.ContextHardLimitBytes
-		} else {
-			cfg.ContextCompression.HardLimitBytes = defaults.ContextCompression.HardLimitBytes
-		}
+		cfg.ContextCompression.HardLimitBytes = defaults.ContextCompression.HardLimitBytes
 	}
 	if cfg.ContextCompression.SummaryWindowMessages <= 0 {
-		if cfg.ContextSummaryWindowMessages > 0 {
-			cfg.ContextCompression.SummaryWindowMessages = cfg.ContextSummaryWindowMessages
-		} else {
-			cfg.ContextCompression.SummaryWindowMessages = defaults.ContextCompression.SummaryWindowMessages
-		}
+		cfg.ContextCompression.SummaryWindowMessages = defaults.ContextCompression.SummaryWindowMessages
 	}
 	if cfg.ContextCompression.HardLimitBytes <= cfg.ContextCompression.SoftLimitBytes {
 		cfg.ContextCompression.HardLimitBytes = defaults.ContextCompression.HardLimitBytes
@@ -138,17 +165,11 @@ func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	if cfg.ContextCompression.MicrocompactKeepRecent <= 0 {
 		cfg.ContextCompression.MicrocompactKeepRecent = defaults.ContextCompression.MicrocompactKeepRecent
 	}
-	if cfg.ContextCompression.ArtifactMaxBytes <= 0 {
-		cfg.ContextCompression.ArtifactMaxBytes = defaults.ContextCompression.ArtifactMaxBytes
-	}
 	if cfg.ContextCompression.CompactMinTailMessages <= 0 {
 		cfg.ContextCompression.CompactMinTailMessages = defaults.ContextCompression.CompactMinTailMessages
 	}
-	if !cfg.ContextCompression.SessionMemoryEnabled && originalContextCompression == (ContextCompressionConfig{}) {
-		cfg.ContextCompression.SessionMemoryEnabled = defaults.ContextCompression.SessionMemoryEnabled
-	}
 
-	if !cfg.SessionMemory.Enabled && originalSessionMemory == (SessionMemoryConfig{}) {
+	if !cfg.SessionMemory.enabledSet {
 		cfg.SessionMemory.Enabled = defaults.SessionMemory.Enabled
 	}
 	if cfg.SessionMemory.MinGrowthBytes <= 0 {
@@ -160,29 +181,74 @@ func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	if cfg.SessionMemory.MaxUpdateBytes <= 0 {
 		cfg.SessionMemory.MaxUpdateBytes = defaults.SessionMemory.MaxUpdateBytes
 	}
-	if cfg.SessionMemory.RequestTimeoutSeconds <= 0 {
-		cfg.SessionMemory.RequestTimeoutSeconds = defaults.SessionMemory.RequestTimeoutSeconds
-	}
-	if cfg.SessionMemory.MaxRetries <= 0 {
-		cfg.SessionMemory.MaxRetries = defaults.SessionMemory.MaxRetries
-	}
-	if cfg.SessionMemory.RetryBackoffSeconds <= 0 {
-		cfg.SessionMemory.RetryBackoffSeconds = defaults.SessionMemory.RetryBackoffSeconds
-	}
 	if cfg.SessionMemory.FailureCooldownSeconds <= 0 {
 		cfg.SessionMemory.FailureCooldownSeconds = defaults.SessionMemory.FailureCooldownSeconds
 	}
-
-	// Keep deprecated flat fields in sync after normalization.
-	cfg.ContextSoftLimitBytes = cfg.ContextCompression.SoftLimitBytes
-	cfg.ContextHardLimitBytes = cfg.ContextCompression.HardLimitBytes
-	cfg.ContextSummaryWindowMessages = cfg.ContextCompression.SummaryWindowMessages
+	cfg.ContextCompression.SessionMemoryEnabled = cfg.SessionMemory.Enabled
 
 	return cfg, warnings
 }
 
-// Global AI config accessible by scanner
+func DefaultOrchestrationConfig() OrchestrationConfig {
+	return OrchestrationConfig{
+		Enabled:             true,
+		SSEHeartbeatSeconds: 15,
+		Planner: ParallelRoleConfig{
+			Parallelism: 1,
+		},
+		Worker: ModelRoleConfig{
+			Parallelism: 4,
+		},
+		Integrator: ParallelRoleConfig{
+			Parallelism: 2,
+		},
+		Validator: ModelRoleConfig{
+			Parallelism: 2,
+		},
+		Persistence: ParallelRoleConfig{
+			Parallelism: 1,
+		},
+	}
+}
+
+func NormalizeOrchestrationConfig(cfg OrchestrationConfig) OrchestrationConfig {
+	defaults := DefaultOrchestrationConfig()
+
+	if !cfg.enabledSet {
+		cfg.Enabled = defaults.Enabled
+	}
+	if cfg.SSEHeartbeatSeconds <= 0 {
+		cfg.SSEHeartbeatSeconds = defaults.SSEHeartbeatSeconds
+	}
+
+	cfg.Planner = normalizeParallelRoleConfig(cfg.Planner, defaults.Planner)
+	cfg.Worker = normalizeModelRoleConfig(cfg.Worker, defaults.Worker)
+	cfg.Integrator = normalizeParallelRoleConfig(cfg.Integrator, defaults.Integrator)
+	cfg.Validator = normalizeModelRoleConfig(cfg.Validator, defaults.Validator)
+	cfg.Persistence = normalizeParallelRoleConfig(cfg.Persistence, defaults.Persistence)
+
+	return cfg
+}
+
+func normalizeParallelRoleConfig(cfg, defaults ParallelRoleConfig) ParallelRoleConfig {
+	if cfg.Parallelism <= 0 {
+		cfg.Parallelism = defaults.Parallelism
+	}
+	return cfg
+}
+
+func normalizeModelRoleConfig(cfg, defaults ModelRoleConfig) ModelRoleConfig {
+	if cfg.Parallelism <= 0 {
+		cfg.Parallelism = defaults.Parallelism
+	}
+	return cfg
+}
+
+// Global AI config accessible by scanner.
 var AI AIConfig
 
-// Global scanner config accessible by scanner
+// Global scanner config accessible by scanner.
 var Scanner ScannerConfig
+
+// Global orchestration config accessible by the orchestration service.
+var Orchestration OrchestrationConfig
