@@ -18,7 +18,6 @@ import (
 type createUserRequest struct {
 	Username                string              `json:"username"`
 	Password                string              `json:"password"`
-	Role                    string              `json:"role"`
 	OrganizationAssignments []orgsvc.Assignment `json:"organization_assignments"`
 }
 
@@ -65,11 +64,6 @@ func CreateUserHandler(c *gin.Context) {
 
 	username := strings.TrimSpace(req.Username)
 	password := req.Password
-	role, err := authsvc.NormalizeRole(req.Role)
-	if err != nil || role == model.RoleSuperAdmin {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Role must be admin or observer"})
-		return
-	}
 	if username == "" || password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
 		return
@@ -84,7 +78,7 @@ func CreateUserHandler(c *gin.Context) {
 	user := model.User{
 		Username:     username,
 		PasswordHash: hash,
-		Role:         role,
+		Role:         model.RoleUser,
 		Enabled:      true,
 		TokenVersion: 1,
 	}

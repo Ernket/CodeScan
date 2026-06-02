@@ -32,16 +32,10 @@ const error = ref('')
 const createForm = ref({
   username: '',
   password: '',
-  role: 'observer',
   organization_assignments: [],
 })
 const resetPasswords = ref({})
 const assignmentEditors = ref({})
-
-const roleOptions = [
-  { value: 'observer', label: 'Observer' },
-  { value: 'admin', label: 'Admin' },
-]
 
 const organizationRoleOptions = computed(() => [
   { value: 'member', label: props.t('accountManagement.organizationRoles.member') },
@@ -50,7 +44,6 @@ const organizationRoleOptions = computed(() => [
 
 const accountErrorKeys = {
   'Failed to list users': 'failedLoadAccounts',
-  'Role must be admin or observer': 'roleMustBeAdminOrObserver',
   'Username and password are required': 'usernamePasswordRequired',
   'Failed to hash password': 'failedHashPassword',
   'Username already exists': 'usernameAlreadyExists',
@@ -112,17 +105,8 @@ function syncAssignmentEditors(nextUsers) {
   ]))
 }
 
-function roleLabel(role) {
-  switch (role) {
-    case 'super_admin':
-      return 'Super Admin'
-    case 'admin':
-      return 'Admin'
-    case 'observer':
-      return 'Observer'
-    default:
-      return role || props.t('accountManagement.unknownRole')
-  }
+function isSuperAdmin(user) {
+  return user?.is_super_admin === true || user?.role === 'super_admin'
 }
 
 function statusLabel(enabled) {
@@ -133,17 +117,6 @@ function statusClass(enabled) {
   return enabled
     ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
     : 'border-slate-500/30 bg-slate-500/10 text-slate-300'
-}
-
-function roleClass(role) {
-  switch (role) {
-    case 'super_admin':
-      return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200'
-    case 'admin':
-      return 'border-amber-500/30 bg-amber-500/10 text-amber-200'
-    default:
-      return 'border-slate-500/30 bg-slate-500/10 text-slate-300'
-  }
 }
 
 function assignmentLabel(assignment) {
@@ -204,10 +177,9 @@ async function createUser() {
     await axios.post(`${props.apiUrl}/users`, {
       username: createForm.value.username,
       password: createForm.value.password,
-      role: createForm.value.role,
       organization_assignments: normalizeAssignments(createForm.value.organization_assignments),
     }, authConfig())
-    createForm.value = { username: '', password: '', role: 'observer', organization_assignments: [] }
+    createForm.value = { username: '', password: '', organization_assignments: [] }
     await loadUsers()
   } catch (requestError) {
     handleRequestError(requestError, props.t('accountManagement.failedCreateAccount'))
@@ -345,18 +317,6 @@ onMounted(loadUsers)
             >
           </div>
 
-          <div class="space-y-2">
-            <label class="text-sm font-medium text-slate-300">{{ t('accountManagement.role') }}</label>
-            <select
-              v-model="createForm.role"
-              class="w-full px-4 py-3 bg-slate-900/80 border border-slate-600 rounded-xl focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary outline-none transition-all text-white"
-            >
-              <option v-for="option in roleOptions" :key="option.value" :value="option.value">
-                {{ option.label }}
-              </option>
-            </select>
-          </div>
-
           <div class="space-y-3">
             <div class="flex items-center justify-between gap-3">
               <label class="text-sm font-medium text-slate-300">{{ t('accountManagement.organizationAccessTitle') }}</label>
@@ -445,8 +405,11 @@ onMounted(loadUsers)
               <div class="min-w-0">
                 <div class="flex flex-wrap items-center gap-2">
                   <h3 class="text-lg font-semibold text-white">{{ user.username }}</h3>
-                  <span :class="['rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide', roleClass(user.role)]">
-                    {{ roleLabel(user.role) }}
+                  <span
+                    v-if="isSuperAdmin(user)"
+                    class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-cyan-200"
+                  >
+                    {{ t('accountManagement.superAdmin') }}
                   </span>
                   <span :class="['rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide', statusClass(user.enabled)]">
                     {{ statusLabel(user.enabled) }}

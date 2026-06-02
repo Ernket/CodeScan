@@ -57,6 +57,46 @@ func TestLoginHandlerSuccess(t *testing.T) {
 	}
 }
 
+func TestLoginHandlerNormalizesLegacyOrdinaryRole(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupAuthHandlerDB(t)
+	user := createAuthTestUser(t, db, "operator", "correct-password", model.RoleAdmin, true, 2)
+	now := time.Unix(100, 0)
+	restore := setAuthClockForTest(now)
+	defer restore()
+
+	w := performLoginRequest(t, "token-secret", map[string]string{
+		"username": "operator",
+		"password": "correct-password",
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var payload struct {
+		Token string       `json:"token"`
+		User  userResponse `json:"user"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal login response: %v", err)
+	}
+	if payload.User.ID != user.ID || payload.User.Username != "operator" {
+		t.Fatalf("unexpected user response: %+v", payload.User)
+	}
+	if payload.User.Role != model.RoleUser || payload.User.IsSuperAdmin {
+		t.Fatalf("expected ordinary user response, got %+v", payload.User)
+	}
+
+	claims, err := authsvc.ParseToken(payload.Token, "token-secret", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("parse issued token: %v", err)
+	}
+	if claims.Role != model.RoleUser {
+		t.Fatalf("expected token role %q, got %q", model.RoleUser, claims.Role)
+	}
+}
+
 func TestLoginHandlerRejectsWrongPassword(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupAuthHandlerDB(t)

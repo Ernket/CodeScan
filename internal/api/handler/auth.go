@@ -23,6 +23,7 @@ type userResponse struct {
 	ID                      uint                                 `json:"id"`
 	Username                string                               `json:"username"`
 	Role                    string                               `json:"role"`
+	IsSuperAdmin            bool                                 `json:"is_super_admin"`
 	Enabled                 *bool                                `json:"enabled,omitempty"`
 	CreatedAt               string                               `json:"created_at,omitempty"`
 	UpdatedAt               string                               `json:"updated_at,omitempty"`
@@ -38,10 +39,12 @@ type userOrganizationAssignmentResponse struct {
 var authClock = time.Now
 
 func newUserResponse(user model.User, includeAdminFields bool) userResponse {
+	role := authsvc.ResponseRole(user.Role)
 	response := userResponse{
-		ID:       user.ID,
-		Username: user.Username,
-		Role:     user.Role,
+		ID:           user.ID,
+		Username:     user.Username,
+		Role:         role,
+		IsSuperAdmin: role == model.RoleSuperAdmin,
 	}
 	if includeAdminFields {
 		enabled := user.Enabled

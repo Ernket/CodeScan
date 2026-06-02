@@ -4,6 +4,7 @@ import "time"
 
 const (
 	RoleSuperAdmin = "super_admin"
+	RoleUser       = "user"
 	RoleAdmin      = "admin"
 	RoleObserver   = "observer"
 

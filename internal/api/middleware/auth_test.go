@@ -20,7 +20,7 @@ import (
 func TestAuthMiddlewareAcceptsValidBearerToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupMiddlewareAuthDB(t)
-	user := createMiddlewareAuthUser(t, db, "admin", model.RoleAdmin, true, 2)
+	user := createMiddlewareAuthUser(t, db, "operator", model.RoleUser, true, 2)
 	token := mustMiddlewareToken(t, "secret", user, time.Now(), authsvc.DefaultTokenTTL)
 
 	w := performMiddlewareAuthRequest(token, "secret")
@@ -28,8 +28,24 @@ func TestAuthMiddlewareAcceptsValidBearerToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), model.RoleAdmin) {
-		t.Fatalf("expected role in response, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), model.RoleUser) {
+		t.Fatalf("expected normalized user role in response, got %s", w.Body.String())
+	}
+}
+
+func TestAuthMiddlewareNormalizesLegacyOrdinaryRoles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupMiddlewareAuthDB(t)
+	user := createMiddlewareAuthUser(t, db, "legacy-admin", model.RoleAdmin, true, 2)
+	token := mustMiddlewareToken(t, "secret", user, time.Now(), authsvc.DefaultTokenTTL)
+
+	w := performMiddlewareAuthRequest(token, "secret")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), model.RoleUser) {
+		t.Fatalf("expected legacy admin to be normalized to user, got %s", w.Body.String())
 	}
 }
 
@@ -99,7 +115,7 @@ func TestAuthMiddlewareRejectsStaleTokenVersion(t *testing.T) {
 	}
 }
 
-func TestRequireWriteAllowsAdminAndRejectsObserver(t *testing.T) {
+func TestRequireWriteAllowsOnlySuperAdmin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	for _, tc := range []struct {
@@ -107,9 +123,10 @@ func TestRequireWriteAllowsAdminAndRejectsObserver(t *testing.T) {
 		role       string
 		wantStatus int
 	}{
-		{name: "admin", role: model.RoleAdmin, wantStatus: http.StatusOK},
+		{name: "legacy_admin", role: model.RoleAdmin, wantStatus: http.StatusForbidden},
 		{name: "super_admin", role: model.RoleSuperAdmin, wantStatus: http.StatusOK},
 		{name: "observer", role: model.RoleObserver, wantStatus: http.StatusForbidden},
+		{name: "user", role: model.RoleUser, wantStatus: http.StatusForbidden},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

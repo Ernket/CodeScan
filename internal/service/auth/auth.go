@@ -55,7 +55,7 @@ func GenerateToken(signingKey string, user model.User, now time.Time, ttl time.D
 	claims := Claims{
 		UserID:       user.ID,
 		Username:     user.Username,
-		Role:         user.Role,
+		Role:         ResponseRole(user.Role),
 		TokenVersion: user.TokenVersion,
 		ExpiresAt:    now.Add(ttl).Unix(),
 	}
@@ -103,39 +103,43 @@ func NormalizeRole(role string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case model.RoleSuperAdmin:
 		return model.RoleSuperAdmin, nil
+	case model.RoleUser:
+		return model.RoleUser, nil
 	case model.RoleAdmin:
-		return model.RoleAdmin, nil
+		return model.RoleUser, nil
 	case model.RoleObserver:
-		return model.RoleObserver, nil
+		return model.RoleUser, nil
 	default:
 		return "", ErrInvalidRole
 	}
 }
 
-func CanRead(role string) bool {
-	switch role {
-	case model.RoleSuperAdmin, model.RoleAdmin, model.RoleObserver:
-		return true
-	default:
-		return false
+func ResponseRole(role string) string {
+	normalized, err := NormalizeRole(role)
+	if err != nil {
+		return ""
 	}
+	return normalized
+}
+
+func CanRead(role string) bool {
+	_, err := NormalizeRole(role)
+	return err == nil
 }
 
 func CanWrite(role string) bool {
-	switch role {
-	case model.RoleSuperAdmin, model.RoleAdmin:
-		return true
-	default:
-		return false
-	}
+	normalized, err := NormalizeRole(role)
+	return err == nil && normalized == model.RoleSuperAdmin
 }
 
 func CanDelete(role string) bool {
-	return role == model.RoleSuperAdmin
+	normalized, err := NormalizeRole(role)
+	return err == nil && normalized == model.RoleSuperAdmin
 }
 
 func CanManageUsers(role string) bool {
-	return role == model.RoleSuperAdmin
+	normalized, err := NormalizeRole(role)
+	return err == nil && normalized == model.RoleSuperAdmin
 }
 
 func sign(payload, signingKey string) string {

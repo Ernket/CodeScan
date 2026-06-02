@@ -44,10 +44,54 @@ func TestCreateUserHandlerRollsBackWhenOrganizationAssignmentInvalid(t *testing.
 	}
 }
 
+func TestCreateUserHandlerIgnoresRequestedSystemRole(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupUserHandlerDB(t)
+	org := createUserHandlerTestOrganization(t, db, "Engineering")
+
+	w := performCreateUserRequest(t, map[string]any{
+		"username": "operator",
+		"password": "secret-password",
+		"role":     model.RoleSuperAdmin,
+		"organization_assignments": []map[string]any{
+			{"organization_id": org.ID, "role": model.OrganizationRoleAdmin},
+		},
+	})
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusCreated, w.Code, w.Body.String())
+	}
+
+	var payload userResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal create user response: %v", err)
+	}
+	if payload.Role != model.RoleUser {
+		t.Fatalf("expected response role %q, got %q", model.RoleUser, payload.Role)
+	}
+	if payload.IsSuperAdmin {
+		t.Fatal("expected created user not to be a super admin")
+	}
+
+	var user model.User
+	if err := db.Preload("OrganizationMemberships").First(&user, "username = ?", "operator").Error; err != nil {
+		t.Fatalf("reload created user: %v", err)
+	}
+	if user.Role != model.RoleUser {
+		t.Fatalf("expected stored role %q, got %q", model.RoleUser, user.Role)
+	}
+	if len(user.OrganizationMemberships) != 1 {
+		t.Fatalf("expected one organization membership, got %d", len(user.OrganizationMemberships))
+	}
+	if user.OrganizationMemberships[0].OrganizationID != org.ID || user.OrganizationMemberships[0].Role != model.OrganizationRoleAdmin {
+		t.Fatalf("unexpected organization membership: %+v", user.OrganizationMemberships[0])
+	}
+}
+
 func TestChangeOwnPasswordHandlerUpdatesPasswordAndRevokesTokens(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupUserHandlerDB(t)
-	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleAdmin, 4)
+	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleUser, 4)
 
 	w := performChangeOwnPasswordRequest(t, user, map[string]string{
 		"current_password": "old-password",
@@ -76,7 +120,7 @@ func TestChangeOwnPasswordHandlerUpdatesPasswordAndRevokesTokens(t *testing.T) {
 func TestChangeOwnPasswordHandlerRejectsWrongCurrentPassword(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupUserHandlerDB(t)
-	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleAdmin, 4)
+	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleUser, 4)
 
 	w := performChangeOwnPasswordRequest(t, user, map[string]string{
 		"current_password": "wrong-password",
@@ -102,7 +146,7 @@ func TestChangeOwnPasswordHandlerRejectsWrongCurrentPassword(t *testing.T) {
 func TestChangeOwnPasswordHandlerRequiresBothPasswords(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupUserHandlerDB(t)
-	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleAdmin, 4)
+	user := createUserHandlerTestUser(t, db, "operator", "old-password", model.RoleUser, 4)
 
 	w := performChangeOwnPasswordRequest(t, user, map[string]string{
 		"current_password": "old-password",
@@ -116,7 +160,7 @@ func TestChangeOwnPasswordHandlerRequiresBothPasswords(t *testing.T) {
 func TestResetUserPasswordHandlerUpdatesTargetPasswordAndRevokesTokens(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupUserHandlerDB(t)
-	target := createUserHandlerTestUser(t, db, "observer", "old-password", model.RoleObserver, 2)
+	target := createUserHandlerTestUser(t, db, "observer", "old-password", model.RoleUser, 2)
 
 	w := performResetUserPasswordRequest(t, target.ID, map[string]string{
 		"password": "new-password",
@@ -180,6 +224,20 @@ func createUserHandlerTestUser(t *testing.T, db *gorm.DB, username, password, ro
 		t.Fatalf("create test user: %v", err)
 	}
 	return user
+}
+
+func createUserHandlerTestOrganization(t *testing.T, db *gorm.DB, name string) model.Organization {
+	t.Helper()
+
+	org := model.Organization{Name: name, Path: "", Depth: 0}
+	if err := db.Create(&org).Error; err != nil {
+		t.Fatalf("create test organization: %v", err)
+	}
+	org.Path = "/" + strconv.FormatUint(uint64(org.ID), 10) + "/"
+	if err := db.Model(&model.Organization{}).Where("id = ?", org.ID).Update("path", org.Path).Error; err != nil {
+		t.Fatalf("update test organization path: %v", err)
+	}
+	return org
 }
 
 func performCreateUserRequest(t *testing.T, payload map[string]any) *httptest.ResponseRecorder {

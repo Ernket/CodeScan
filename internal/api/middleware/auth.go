@@ -43,13 +43,15 @@ func AuthMiddleware(authKey string) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token has been revoked"})
 			return
 		}
-		if _, err := authsvc.NormalizeRole(user.Role); err != nil {
+		normalizedRole, err := authsvc.NormalizeRole(user.Role)
+		if err != nil {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Invalid user role"})
 			return
 		}
+		user.Role = normalizedRole
 		c.Set("current_user", user)
 		c.Set("current_user_id", user.ID)
-		c.Set("current_user_role", user.Role)
+		c.Set("current_user_role", normalizedRole)
 		c.Next()
 	}
 }
