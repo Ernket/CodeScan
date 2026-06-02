@@ -30,6 +30,11 @@ type resetUserPasswordRequest struct {
 	Password string `json:"password"`
 }
 
+type changeOwnPasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
 type replaceUserOrganizationsRequest struct {
 	Assignments []orgsvc.Assignment `json:"assignments"`
 }
@@ -215,6 +220,50 @@ func ResetUserPasswordHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, newUserResponse(user, true))
+}
+
+func ChangeOwnPasswordHandler(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		return
+	}
+
+	var req changeOwnPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Current password and new password are required"})
+		return
+	}
+	if !authsvc.CheckPassword(user.PasswordHash, req.CurrentPassword) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Current password is incorrect"})
+		return
+	}
+
+	hash, err := authsvc.HashPassword(req.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
+
+	result := database.DB.Model(&model.User{}).
+		Where("id = ?", user.ID).
+		Updates(map[string]any{
+			"password_hash": hash,
+			"token_version": gorm.Expr("token_version + ?", 1),
+		})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to change password"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func ReplaceUserOrganizationsHandler(c *gin.Context) {

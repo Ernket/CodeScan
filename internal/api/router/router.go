@@ -37,6 +37,7 @@ func InitRouterWithFrontend(r *gin.Engine, authKey string, frontend fs.FS) {
 			auth.GET("/tasks/:id/orchestration/agents", handler.GetOrchestrationAgentsHandler)
 			auth.GET("/tasks/:id/orchestration/events", handler.OrchestrationEventsHandler)
 			auth.GET("/organizations/accessible", handler.GetAccessibleOrganizationsHandler)
+			auth.POST("/me/password", handler.ChangeOwnPasswordHandler)
 			auth.POST("/tasks", handler.UploadHandler)
 			auth.POST("/tasks/:id/pause", handler.PauseTaskHandler)
 			auth.POST("/tasks/:id/resume", handler.ResumeTaskHandler)

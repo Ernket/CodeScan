@@ -62,9 +62,13 @@ const tasks = ref([])
 const stats = ref(createEmptyStats())
 const accessibleOrganizations = ref([])
 const showUploadModal = ref(false)
+const showPasswordModal = ref(false)
 const rerunModalOpen = ref(false)
 const uploadForm = ref({ name: '', remark: '', file: null, organization_id: '' })
+const passwordForm = ref({ currentPassword: '', newPassword: '', confirmPassword: '' })
+const passwordError = ref('')
 const isUploading = ref(false)
+const isChangingPassword = ref(false)
 const isRepairing = ref(false)
 const isLoading = ref(false)
 const isTaskLoading = ref(false)
@@ -485,6 +489,14 @@ const rerunStageOptions = computed(() => {
 
 const authConfig = () => ({ headers: { Authorization: `Bearer ${authKey.value}` } })
 
+const passwordErrorKeys = {
+  'Current password and new password are required': 'required',
+  'Current password is incorrect': 'currentIncorrect',
+  'Failed to hash password': 'failed',
+  'Failed to change password': 'failed',
+  'User not found': 'userNotFound',
+}
+
 const organizationErrorKeys = {
   'organization_id is required': 'organizationIdRequired',
   'Failed to inspect organization permissions': 'failedInspectPermissions',
@@ -499,6 +511,66 @@ const translateOrganizationError = (message, fallback = '') => {
     if (translated !== `organizations.${key}`) return translated
   }
   return trimmed || fallback
+}
+
+const translatePasswordError = (message, fallback = '') => {
+  const trimmed = String(message || '').trim()
+  const key = passwordErrorKeys[trimmed]
+  if (key) {
+    const translated = t(`password.${key}`)
+    if (translated !== `password.${key}`) return translated
+  }
+  return trimmed || fallback || t('password.failed')
+}
+
+const resetPasswordForm = () => {
+  passwordForm.value = { currentPassword: '', newPassword: '', confirmPassword: '' }
+  passwordError.value = ''
+}
+
+const openPasswordModal = () => {
+  resetPasswordForm()
+  showPasswordModal.value = true
+}
+
+const closePasswordModal = () => {
+  if (isChangingPassword.value) return
+  showPasswordModal.value = false
+  resetPasswordForm()
+}
+
+const submitPasswordChange = async () => {
+  passwordError.value = ''
+  const currentPassword = passwordForm.value.currentPassword
+  const newPassword = passwordForm.value.newPassword
+  const confirmPassword = passwordForm.value.confirmPassword
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    passwordError.value = t('password.required')
+    return
+  }
+  if (newPassword !== confirmPassword) {
+    passwordError.value = t('password.mismatch')
+    return
+  }
+
+  isChangingPassword.value = true
+  try {
+    await axios.post(`${API_URL}/me/password`, {
+      current_password: currentPassword,
+      new_password: newPassword,
+    }, authConfig())
+    alert(t('password.changed'))
+    logout()
+  } catch (e) {
+    const message = e.response?.data?.error
+    if (e.response?.status === 401 && String(message || '').trim() !== 'Current password is incorrect') {
+      logout()
+      return
+    }
+    passwordError.value = translatePasswordError(message, e.message)
+  } finally {
+    isChangingPassword.value = false
+  }
 }
 
 const normalizeStatsResponse = (payload = {}) => ({
@@ -936,11 +1008,14 @@ const login = async () => {
 const logout = () => {
   cancelDetailRequest()
   isAuthenticated.value = false
+  showPasswordModal.value = false
+  isChangingPassword.value = false
   localStorage.removeItem('auth_token')
   localStorage.removeItem('current_user')
   authKey.value = ''
   currentUser.value = null
   loginForm.value.password = ''
+  resetPasswordForm()
   tasks.value = []
   accessibleOrganizations.value = []
   uploadForm.value = { name: '', remark: '', file: null, organization_id: '' }
@@ -1307,6 +1382,15 @@ onBeforeUnmount(() => {
                 class="px-3 py-2 rounded-lg border border-white/10 bg-white/5 text-sm font-semibold text-slate-200 hover:bg-white/10 transition-colors"
               >
                 {{ t('app.languageToggle') }}
+              </button>
+              <button
+                type="button"
+                :title="t('password.changePassword')"
+                :aria-label="t('password.changePassword')"
+                class="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-200 transition-colors hover:bg-white/10 hover:text-cyan-200"
+                @click="openPasswordModal"
+              >
+                <KeyRound class="w-5 h-5" />
               </button>
               <button
                 v-if="canCreateProject"
@@ -2044,6 +2128,90 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </div>
+          </div>
+        </transition>
+
+        <!-- Password Modal -->
+        <transition name="fade">
+          <div v-if="showPasswordModal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div class="absolute inset-0 bg-black/80 backdrop-blur-sm" @click="closePasswordModal"></div>
+
+            <form
+              class="relative z-10 w-full max-w-md glass-panel rounded-2xl p-7 border-t border-cyan-500/30 shadow-[0_0_50px_rgba(0,0,0,0.5)] animate-slide-up"
+              @submit.prevent="submitPasswordChange"
+            >
+              <button
+                type="button"
+                class="absolute top-4 right-4 text-slate-400 transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="isChangingPassword"
+                @click="closePasswordModal"
+              >
+                <XCircle class="w-6 h-6" />
+              </button>
+
+              <div class="mb-6">
+                <div class="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-cyan-500/10 text-cyan-300">
+                  <KeyRound class="w-6 h-6" />
+                </div>
+                <h2 class="text-2xl font-bold text-white">{{ t('password.title') }}</h2>
+                <p class="mt-2 text-sm text-slate-400">{{ t('password.subtitle') }}</p>
+              </div>
+
+              <div class="space-y-4">
+                <div class="space-y-2">
+                  <label class="text-sm font-medium text-slate-300">{{ t('password.currentPassword') }}</label>
+                  <input
+                    v-model="passwordForm.currentPassword"
+                    type="password"
+                    autocomplete="current-password"
+                    class="w-full rounded-xl border border-slate-600 bg-slate-900/50 px-4 py-3 text-white outline-none transition-all placeholder-slate-600 focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary"
+                  >
+                </div>
+
+                <div class="space-y-2">
+                  <label class="text-sm font-medium text-slate-300">{{ t('password.newPassword') }}</label>
+                  <input
+                    v-model="passwordForm.newPassword"
+                    type="password"
+                    autocomplete="new-password"
+                    class="w-full rounded-xl border border-slate-600 bg-slate-900/50 px-4 py-3 text-white outline-none transition-all placeholder-slate-600 focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary"
+                  >
+                </div>
+
+                <div class="space-y-2">
+                  <label class="text-sm font-medium text-slate-300">{{ t('password.confirmPassword') }}</label>
+                  <input
+                    v-model="passwordForm.confirmPassword"
+                    type="password"
+                    autocomplete="new-password"
+                    class="w-full rounded-xl border border-slate-600 bg-slate-900/50 px-4 py-3 text-white outline-none transition-all placeholder-slate-600 focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary"
+                  >
+                </div>
+
+                <div v-if="passwordError" class="rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                  {{ passwordError }}
+                </div>
+
+                <div class="flex justify-end gap-3 pt-2">
+                  <button
+                    type="button"
+                    class="rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="isChangingPassword"
+                    @click="closePasswordModal"
+                  >
+                    {{ t('password.cancel') }}
+                  </button>
+                  <button
+                    type="submit"
+                    class="inline-flex items-center justify-center gap-2 rounded-xl bg-cyber-primary px-5 py-2.5 text-sm font-bold text-black transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="isChangingPassword"
+                  >
+                    <span v-if="isChangingPassword" class="h-4 w-4 rounded-full border-2 border-black/30 border-t-black animate-spin"></span>
+                    {{ isChangingPassword ? t('password.saving') : t('password.submit') }}
+                  </button>
+                </div>
+              </div>
+            </form>
           </div>
         </transition>
 
