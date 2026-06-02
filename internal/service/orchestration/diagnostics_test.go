@@ -97,9 +97,9 @@ func TestBuildSnapshotDiagnosticsBlockedBeatsRunning(t *testing.T) {
 	}
 }
 
-func TestBuildSnapshotDiagnosticsStalledAfterThreeMinutesWithoutProgress(t *testing.T) {
+func TestBuildSnapshotDiagnosticsStalledAfterFifteenMinutesWithoutActiveProgress(t *testing.T) {
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
-	lastProgress := now.Add(-181 * time.Second)
+	lastProgress := now.Add(-(stallThreshold + time.Second))
 	run := &model.TaskRun{
 		ID:             "run-1",
 		Status:         runStatusRunning,
@@ -128,8 +128,128 @@ func TestBuildSnapshotDiagnosticsStalledAfterThreeMinutesWithoutProgress(t *test
 	if diagnostics.CurrentStage != "auth" {
 		t.Fatalf("expected auth to be marked as stalled stage, got %q", diagnostics.CurrentStage)
 	}
-	if diagnostics.SilenceSeconds < 181 {
-		t.Fatalf("expected silence seconds >= 181, got %d", diagnostics.SilenceSeconds)
+	if diagnostics.StallThresholdSeconds != int64(stallThreshold/time.Second) {
+		t.Fatalf("expected stall threshold seconds %d, got %d", int64(stallThreshold/time.Second), diagnostics.StallThresholdSeconds)
+	}
+	if diagnostics.FocusSilenceSeconds < int64(stallThreshold/time.Second) {
+		t.Fatalf("expected focus silence seconds >= threshold, got %d", diagnostics.FocusSilenceSeconds)
+	}
+	if diagnostics.ActiveAgentRunID != "agent-1" {
+		t.Fatalf("expected active agent id agent-1, got %q", diagnostics.ActiveAgentRunID)
+	}
+	if diagnostics.StallCandidateSince == nil || !diagnostics.StallCandidateSince.Equal(lastProgress) {
+		t.Fatalf("expected stall candidate since %v, got %v", lastProgress, diagnostics.StallCandidateSince)
+	}
+}
+
+func TestBuildSnapshotDiagnosticsRouteInventoryWaitIsDependencyWaiting(t *testing.T) {
+	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-30 * time.Minute)
+	run := &model.TaskRun{
+		ID:             "run-1",
+		Status:         runStatusRunning,
+		PlannerPending: false,
+		StartedAt:      old,
+		CreatedAt:      old,
+		UpdatedAt:      old,
+	}
+	subtasks := []model.TaskSubtask{
+		testSubtask("init", 0, subtaskStatusRunning, roleStatusRunning, roleStatusPending, roleStatusPending, roleStatusPending, old),
+		testSubtask("rce", 10, subtaskStatusBlocked, roleStatusPending, roleStatusPending, roleStatusPending, roleStatusPending, old),
+	}
+	subtasks[1].BlockedReason = "waiting for route inventory"
+
+	diagnostics := buildSnapshotDiagnostics(run, subtasks, nil, nil, now)
+	if diagnostics.Stalled {
+		t.Fatal("did not expect stalled diagnostics for route inventory dependency wait")
+	}
+	if diagnostics.FocusStatus != "running" {
+		t.Fatalf("expected running init focus, got %q", diagnostics.FocusStatus)
+	}
+	if diagnostics.CurrentStage != "init" {
+		t.Fatalf("expected init focus while route inventory is running, got %q", diagnostics.CurrentStage)
+	}
+
+	subtasks[0] = testCompletedSubtask("init", 0, old)
+	diagnostics = buildSnapshotDiagnostics(run, subtasks, nil, nil, now)
+	if diagnostics.Stalled {
+		t.Fatal("did not expect stalled diagnostics for blocked route inventory dependency")
+	}
+	if diagnostics.FocusStatus != "waiting" {
+		t.Fatalf("expected waiting focus, got %q", diagnostics.FocusStatus)
+	}
+	if diagnostics.FocusReason != "dependency_waiting" {
+		t.Fatalf("expected dependency waiting reason, got %q", diagnostics.FocusReason)
+	}
+	if diagnostics.CurrentStage != "rce" {
+		t.Fatalf("expected rce waiting focus, got %q", diagnostics.CurrentStage)
+	}
+}
+
+func TestBuildSnapshotDiagnosticsPlannerPendingDoesNotStall(t *testing.T) {
+	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-45 * time.Minute)
+	run := &model.TaskRun{
+		ID:             "run-1",
+		Status:         runStatusRunning,
+		PlannerPending: true,
+		StartedAt:      old,
+		CreatedAt:      old,
+		UpdatedAt:      old,
+	}
+	subtasks := []model.TaskSubtask{
+		testSubtask("rce", 10, subtaskStatusReady, roleStatusReady, roleStatusPending, roleStatusPending, roleStatusPending, old),
+	}
+
+	diagnostics := buildSnapshotDiagnostics(run, subtasks, nil, nil, now)
+	if diagnostics.Stalled {
+		t.Fatal("did not expect stalled diagnostics while planner is pending")
+	}
+	if diagnostics.FocusStatus != "running" {
+		t.Fatalf("expected planner running focus, got %q", diagnostics.FocusStatus)
+	}
+	if diagnostics.FocusReason != "planner_pending" {
+		t.Fatalf("expected planner pending focus reason, got %q", diagnostics.FocusReason)
+	}
+	if diagnostics.CurrentRole != rolePlanner {
+		t.Fatalf("expected planner current role, got %q", diagnostics.CurrentRole)
+	}
+}
+
+func TestBuildSnapshotDiagnosticsRecentActiveEventAvoidsStall(t *testing.T) {
+	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-30 * time.Minute)
+	recent := now.Add(-2 * time.Minute)
+	run := &model.TaskRun{
+		ID:             "run-1",
+		Status:         runStatusRunning,
+		PlannerPending: false,
+		StartedAt:      old,
+		CreatedAt:      old,
+		UpdatedAt:      old,
+	}
+	subtasks := []model.TaskSubtask{
+		testSubtask("rce", 10, subtaskStatusRunning, roleStatusRunning, roleStatusPending, roleStatusPending, roleStatusPending, old),
+	}
+	agents := []model.TaskAgentRun{
+		{ID: "agent-1", SubtaskID: subtasks[0].ID, Role: roleWorker, Stage: "rce", Status: roleStatusRunning, UpdatedAt: old, CreatedAt: old},
+	}
+	events := []model.TaskEvent{
+		{Sequence: 10, SubtaskID: subtasks[0].ID, AgentRunID: "agent-1", EventType: eventSubtaskUpdated, Message: "worker heartbeat", CreatedAt: recent},
+	}
+
+	diagnostics := buildSnapshotDiagnostics(run, subtasks, agents, events, now)
+	if diagnostics.Stalled {
+		t.Fatal("did not expect stalled diagnostics with recent active subtask event")
+	}
+	if diagnostics.FocusStatus != "running" {
+		t.Fatalf("expected running focus, got %q", diagnostics.FocusStatus)
+	}
+	if diagnostics.FocusSilenceSeconds != int64(now.Sub(recent)/time.Second) {
+		t.Fatalf("expected focus silence from recent event, got %d", diagnostics.FocusSilenceSeconds)
+	}
+	if diagnostics.StallCandidateSince == nil || !diagnostics.StallCandidateSince.Equal(recent) {
+		t.Fatalf("expected stall candidate since recent event, got %v", diagnostics.StallCandidateSince)
 	}
 }
 

@@ -165,11 +165,19 @@ func executeToolRound(
 	toolCalls []openai.ToolCall,
 	logFunc func(string),
 ) ([]plannedToolCall, error) {
-	planned := make([]plannedToolCall, 0, len(toolCalls))
-	sharedByKey := map[string]*sharedToolExecution{}
-	parallelJobs := make([]*sharedToolExecution, 0, len(toolCalls))
+	normalizedToolCalls, stats := normalizeToolCalls(toolCalls)
+	if summary := stats.summary("Normalized assistant tool calls before execution"); summary != "" {
+		logFunc(summary)
+	}
+	if len(normalizedToolCalls) == 0 {
+		return nil, nil
+	}
 
-	for _, toolCall := range toolCalls {
+	planned := make([]plannedToolCall, 0, len(normalizedToolCalls))
+	sharedByKey := map[string]*sharedToolExecution{}
+	parallelJobs := make([]*sharedToolExecution, 0, len(normalizedToolCalls))
+
+	for _, toolCall := range normalizedToolCalls {
 		callPlan := buildToolCallPlan(planCtx, toolCall)
 		if callPlan.immediateResult != "" || callPlan.hasCachedResult {
 			planned = append(planned, callPlan)

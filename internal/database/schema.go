@@ -19,7 +19,21 @@ type schemaColumn struct {
 
 var requiredSchemaColumns = []schemaColumn{
 	{Table: "tasks", Column: "result", Type: "LONGTEXT"},
+	{Table: "tasks", Column: "output_json", Type: "LONGTEXT"},
+	{Table: "tasks", Column: "logs", Type: "LONGTEXT"},
 	{Table: "task_stages", Column: "result", Type: "LONGTEXT"},
+	{Table: "task_stages", Column: "output_json", Type: "LONGTEXT"},
+	{Table: "task_stages", Column: "logs", Type: "LONGTEXT"},
+	{Table: "task_stages", Column: "meta", Type: "LONGTEXT"},
+	{Table: "task_runs", Column: "summary_json", Type: "LONGTEXT"},
+	{Table: "task_subtasks", Column: "payload_json", Type: "LONGTEXT"},
+	{Table: "task_agent_runs", Column: "input_json", Type: "LONGTEXT"},
+	{Table: "task_agent_runs", Column: "output_json", Type: "LONGTEXT"},
+	{Table: "task_events", Column: "payload_json", Type: "LONGTEXT"},
+	{Table: "task_routes", Column: "evidence_refs", Type: "LONGTEXT"},
+	{Table: "task_routes", Column: "payload_json", Type: "LONGTEXT"},
+	{Table: "task_findings", Column: "evidence_refs", Type: "LONGTEXT"},
+	{Table: "task_findings", Column: "payload_json", Type: "LONGTEXT"},
 }
 
 func BuildDSN(cfg *config.DBConfig, withDatabase bool) string {
@@ -72,6 +86,9 @@ func EnsureDatabase(rootDB *gorm.DB, dbName string) (bool, error) {
 
 func EnsureSchema(db *gorm.DB) ([]string, error) {
 	if err := db.AutoMigrate(
+		&model.User{},
+		&model.Organization{},
+		&model.OrganizationMembership{},
 		&model.Task{},
 		&model.TaskStage{},
 		&model.TaskRun{},

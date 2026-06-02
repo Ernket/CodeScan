@@ -1,7 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildActivityFeed, buildInitStageCard, buildStageMatrixRows, pickDefaultStage, resolveSubtaskDisplayStatus } from './orchestration.js'
+import {
+  buildTaskOrchestrationPreview,
+  buildActivityFeed,
+  buildExecutionQueues,
+  buildInitStageCard,
+  buildOrchestrationFlow,
+  buildStageMatrixRows,
+  isTaskMainView,
+  parseRunScope,
+  pickDefaultRerunStages,
+  pickDefaultStage,
+  resolveSubtaskDisplayStatus,
+} from './orchestration.js'
 
 const translations = {
   'stage.init.label': 'Route Inventory',
@@ -52,7 +64,9 @@ const translations = {
   'orchestration.state.completed': 'Completed',
   'orchestration.state.failed': 'Failed',
   'orchestration.state.paused': 'Paused',
+  'orchestration.state.waiting': 'Waiting',
   'orchestration.state.not_started': 'Not Started',
+  'orchestration.queue.plannerPending': 'Planner pending',
 }
 
 function t(key, params = {}) {
@@ -80,7 +94,7 @@ test('pickDefaultStage prioritizes blocked before starting, running, and failed'
   assert.equal(pickDefaultStage(focusEntries), 'xss')
 })
 
-test('buildStageMatrixRows marks waiting-for-route-inventory as not started and starting stage as starting', () => {
+test('buildStageMatrixRows marks waiting-for-route-inventory as waiting and starting stage as starting', () => {
   const snapshot = {
     subtasks: [
       { id: 'init-1', stage: 'init', title: 'Route Inventory', priority: 0, status: 'completed', worker_status: 'completed', integrator_status: 'completed', validator_status: 'skipped', persistence_status: 'completed', started_at: '2026-04-21T12:00:00Z' },
@@ -91,7 +105,7 @@ test('buildStageMatrixRows marks waiting-for-route-inventory as not started and 
   }
 
   const normalRows = buildStageMatrixRows(snapshot, { current_stage: 'auth', focus_status: 'starting', stalled: false }, t)
-  assert.equal(normalRows.find((node) => node.stage === 'rce')?.status, 'not_started')
+  assert.equal(normalRows.find((node) => node.stage === 'rce')?.status, 'waiting')
   assert.equal(normalRows.find((node) => node.stage === 'auth')?.status, 'starting')
 
   const stalledRows = buildStageMatrixRows(snapshot, { current_stage: 'auth', focus_status: 'stalled', stalled: true }, t)
@@ -135,6 +149,80 @@ test('resolveSubtaskDisplayStatus shows starting when role bootstrap is still pe
     }),
     'starting',
   )
+})
+
+test('buildOrchestrationFlow models init gate, active stages, and ready queue counts', () => {
+  const snapshot = {
+    run: {
+      stage_progress: [
+        { stage: 'init', completed_count: 1, subtask_count: 1 },
+        { stage: 'rce', running_count: 1, completed_count: 0, subtask_count: 1 },
+        { stage: 'auth', running_count: 0, completed_count: 0, subtask_count: 1 },
+      ],
+    },
+    subtasks: [
+      { id: 'init-1', stage: 'init', title: 'Route Inventory', priority: 0, status: 'completed', worker_status: 'completed', integrator_status: 'completed', validator_status: 'skipped', persistence_status: 'completed' },
+      { id: 'rce-1', stage: 'rce', title: 'RCE', priority: 10, status: 'running', worker_status: 'running', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending' },
+      { id: 'auth-1', stage: 'auth', title: 'Auth', priority: 30, status: 'ready', worker_status: 'ready', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending' },
+    ],
+  }
+
+  const flow = buildOrchestrationFlow(snapshot, { current_stage: 'rce', focus_status: 'running', focus_subtask_id: 'rce-1' }, t)
+  assert.equal(flow.init.status, 'completed')
+  assert.equal(flow.activeStageCount, 1)
+  assert.equal(flow.queuedUnitCount, 1)
+  assert.equal(flow.completedStageCount, 1)
+  assert.equal(flow.auditStages.find((node) => node.stage === 'rce')?.activeCount, 1)
+  assert.equal(flow.auditStages.find((node) => node.stage === 'auth')?.readyCount, 1)
+})
+
+test('buildOrchestrationFlow keeps downstream nodes locked before init completes', () => {
+  const snapshot = {
+    run: { stage_progress: [] },
+    subtasks: [
+      { id: 'init-1', stage: 'init', title: 'Route Inventory', priority: 0, status: 'ready', worker_status: 'ready', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending' },
+      { id: 'rce-1', stage: 'rce', title: 'RCE', priority: 10, status: 'blocked', worker_status: 'pending', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending', blocked_reason: 'waiting for route inventory' },
+    ],
+  }
+
+  const flow = buildOrchestrationFlow(snapshot, { current_stage: 'init', focus_status: 'waiting' }, t)
+  assert.equal(flow.init.readyCount, 1)
+  assert.equal(flow.auditStages.find((node) => node.stage === 'rce')?.locked, true)
+  assert.equal(flow.auditStages.find((node) => node.stage === 'rce')?.status, 'waiting')
+  assert.equal(flow.auditStages.find((node) => node.stage === 'rce')?.waitingCount, 1)
+})
+
+test('buildExecutionQueues separates active, ready, waiting, and blocked units', () => {
+  const snapshot = {
+    run: { run: { planner_pending: true }, stage_progress: [] },
+    subtasks: [
+      { id: 'rce-1', stage: 'rce', title: 'RCE', priority: 10, status: 'running', worker_status: 'running', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending' },
+      { id: 'auth-1', stage: 'auth', title: 'Auth', priority: 30, status: 'ready', worker_status: 'completed', integrator_status: 'ready', validator_status: 'pending', persistence_status: 'pending' },
+      { id: 'access-1', stage: 'access', title: 'Access', priority: 40, status: 'blocked', worker_status: 'pending', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending', blocked_reason: 'waiting for route inventory' },
+      { id: 'xss-1', stage: 'xss', title: 'XSS', priority: 50, status: 'ready', worker_status: 'pending', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending' },
+      { id: 'logic-1', stage: 'logic', title: 'Logic', priority: 80, status: 'blocked', worker_status: 'pending', integrator_status: 'pending', validator_status: 'pending', persistence_status: 'pending', blocked_reason: 'waiting for review' },
+    ],
+  }
+
+  const queues = buildExecutionQueues(snapshot, {
+    current_stage: 'rce',
+    current_role: 'worker',
+    focus_status: 'running',
+    focus_subtask_id: 'rce-1',
+    planner_pending: true,
+    parallelism: { planner: 1, worker: 2, integrator: 1, validator: 1, persistence: 1 },
+  }, t)
+
+  assert.deepEqual(queues.active.map((unit) => [unit.role, unit.stage]), [['planner', 'rce'], ['worker', 'rce']])
+  assert.deepEqual(queues.ready.map((unit) => [unit.role, unit.stage, unit.position]), [['integrator', 'auth', 1]])
+  assert.equal(queues.ready.some((unit) => unit.stage === 'xss'), false)
+  assert.deepEqual(queues.waiting.map((unit) => [unit.stage, unit.status, unit.position]), [['access', 'waiting', 1], ['xss', 'waiting', 2]])
+  assert.equal(queues.blocked.length, 1)
+  assert.equal(queues.blocked.some((unit) => unit.stage === 'access'), false)
+  assert.equal(queues.totals.active, 2)
+  assert.equal(queues.totals.ready, 1)
+  assert.equal(queues.totals.waiting, 2)
+  assert.equal(queues.totals.blocked, 1)
 })
 
 test('buildActivityFeed maps key events to readable summaries and filters unchanged subtask updates', () => {
@@ -186,4 +274,101 @@ test('buildActivityFeed maps key events to readable summaries and filters unchan
   assert.equal(activities[1].headline, 'Worker started RCE Audit')
   assert.equal(activities[2].headline, 'Planner revision applied')
   assert.match(activities[2].summary, /Reason: integrator completed, created 1, unlocked 1, terminated 0/)
+})
+
+test('pickDefaultRerunStages prefers failed audit stages and falls back to init when routes are missing', () => {
+  assert.deepEqual(
+    pickDefaultRerunStages({
+      status: 'failed',
+      output_json: [],
+      stages: [
+        { name: 'xss', status: 'failed' },
+        { name: 'auth', status: 'failed' },
+        { name: 'rce', status: 'completed' },
+      ],
+    }),
+    ['init', 'auth', 'xss'],
+  )
+
+  assert.deepEqual(
+    pickDefaultRerunStages({
+      status: 'failed',
+      output_json: [{ method: 'GET', path: '/health' }],
+      stages: [
+        { name: 'logic', status: 'failed' },
+      ],
+    }),
+    ['logic'],
+  )
+})
+
+test('parseRunScope normalizes rerun metadata and falls back for legacy runs', () => {
+  assert.deepEqual(
+    parseRunScope({
+      mode: 'rerun_selected',
+      selected_stages: ['xss', 'auth', 'auth'],
+      carried_over_stages: ['init', 'rce'],
+      reused_route_inventory: true,
+    }),
+    {
+      mode: 'rerun_selected',
+      selectedStages: ['auth', 'xss'],
+      carriedOverStages: ['init', 'rce'],
+      reusedRouteInventory: true,
+    },
+  )
+
+  assert.equal(parseRunScope(null).mode, 'full')
+  assert.equal(parseRunScope(null).selectedStages[0], 'init')
+})
+
+test('isTaskMainView only matches overview, orchestration, and report shells', () => {
+  assert.equal(isTaskMainView('task-detail'), true)
+  assert.equal(isTaskMainView('task-orchestration'), true)
+  assert.equal(isTaskMainView('task-report'), true)
+  assert.equal(isTaskMainView('task-auth'), false)
+  assert.equal(isTaskMainView('dashboard'), false)
+})
+
+test('buildTaskOrchestrationPreview normalizes summary states for overview cards', () => {
+  assert.deepEqual(
+    buildTaskOrchestrationPreview(null),
+    {
+      hasRun: false,
+      focusStatus: 'not_started',
+      currentStage: '',
+      activeSubtaskCount: 0,
+      lastProgressAt: '',
+      latestEventAt: '',
+      latestEventMessage: '',
+      lastRunStatus: '',
+    },
+  )
+
+  assert.deepEqual(
+    buildTaskOrchestrationPreview({
+      focus_status: 'running',
+      current_stage: 'auth',
+      active_subtask_count: 3,
+      last_progress_at: '2026-05-20T09:00:00Z',
+      latest_event_at: '2026-05-20T09:01:00Z',
+      latest_event_message: 'worker started for auth.',
+      last_run_status: 'running',
+    }),
+    {
+      hasRun: true,
+      focusStatus: 'running',
+      currentStage: 'auth',
+      activeSubtaskCount: 3,
+      lastProgressAt: '2026-05-20T09:00:00Z',
+      latestEventAt: '2026-05-20T09:01:00Z',
+      latestEventMessage: 'worker started for auth.',
+      lastRunStatus: 'running',
+    },
+  )
+
+  assert.equal(buildTaskOrchestrationPreview({ focus_status: 'paused', last_run_status: 'paused' }).focusStatus, 'paused')
+  assert.equal(buildTaskOrchestrationPreview({ focus_status: 'failed', last_run_status: 'failed' }).focusStatus, 'failed')
+  assert.equal(buildTaskOrchestrationPreview({ focus_status: 'completed', last_run_status: 'completed' }).focusStatus, 'completed')
+  assert.equal(buildTaskOrchestrationPreview({ last_run_status: 'paused' }).focusStatus, 'paused')
 })

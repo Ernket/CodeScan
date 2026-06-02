@@ -75,10 +75,10 @@ func (m *Manager) RecoverActiveRuns() error {
 }
 
 type agentRunStartResult struct {
-	AgentRun model.TaskAgentRun
-	Resume   bool
+	AgentRun  model.TaskAgentRun
+	Resume    bool
 	Scheduled bool
-	Err      error
+	Err       error
 }
 
 type roleExecutionContext struct {
@@ -113,6 +113,7 @@ func (m *Manager) Start(taskID string) (*Snapshot, error) {
 		Status:           runStatusRunning,
 		PlannerPending:   true,
 		LastReplanReason: "run_start",
+		SummaryJSON:      marshalRunScope(buildFullRunScope()),
 		StartedAt:        now,
 	}
 
@@ -208,6 +209,15 @@ func (m *Manager) Summary(taskID string) (*TaskSummary, error) {
 	if err != nil {
 		return nil, err
 	}
+	agents, err := m.loadAgents(run.ID)
+	if err != nil {
+		return nil, err
+	}
+	events, err := m.ListEvents(taskID, 0, 120)
+	if err != nil {
+		return nil, err
+	}
+	diagnostics := buildSnapshotDiagnostics(run, subtasks, agents, events, time.Now())
 
 	summary := &TaskSummary{
 		ActiveRunID:        run.ID,
@@ -215,7 +225,16 @@ func (m *Manager) Summary(taskID string) (*TaskSummary, error) {
 		ActiveSubtaskCount: countActiveSubtasks(subtasks),
 		StageProgress:      buildStageProgress(subtasks),
 		LastRunStatus:      run.Status,
-		LastReplanReason:   run.LastReplanReason,
+	}
+	if diagnostics != nil {
+		summary.LastReplanReason = diagnostics.LastReplanReason
+		summary.FocusStatus = diagnostics.FocusStatus
+		summary.CurrentStage = diagnostics.CurrentStage
+		summary.LastProgressAt = diagnostics.LastProgressAt
+		summary.LatestEventAt = diagnostics.LatestEventAt
+		summary.LatestEventMessage = diagnostics.LatestEventMessage
+	} else {
+		summary.LastReplanReason = run.LastReplanReason
 	}
 
 	if run.Status != runStatusRunning && run.Status != runStatusPaused {
@@ -459,6 +478,9 @@ func (m *Manager) driveRun(runID string) {
 }
 
 func (m *Manager) executePlanner(task *model.Task, run *model.TaskRun, subtasks []model.TaskSubtask) error {
+	scope := decodeRunScope(run)
+	managedStages := scope.managedStages()
+	managedSet := stageSet(managedStages)
 	hasRoutes := m.routesAvailable(task, run.ID)
 	initFailed := false
 	for _, subtask := range subtasks {
@@ -510,12 +532,17 @@ func (m *Manager) executePlanner(task *model.Task, run *model.TaskRun, subtasks 
 		diff.Created = append(diff.Created, stage)
 	}
 
-	ensureSubtask("init")
-	for _, stage := range auditStages() {
+	for _, stage := range managedStages {
 		ensureSubtask(stage)
 	}
 
 	for _, stage := range auditStages() {
+		if _, ok := managedSet[stage]; !ok {
+			continue
+		}
+		if !scope.selectsStage(stage) {
+			continue
+		}
 		subtask := existing[stage]
 		switch {
 		case hasRoutes && subtask.Status == subtaskStatusBlocked && subtask.WorkerStatus == roleStatusPending:
@@ -1186,6 +1213,16 @@ func (m *Manager) finalizeRunIfTerminal(task *model.Task, run *model.TaskRun, su
 		taskStatus = "failed"
 		eventType = eventRunFailed
 		message = "Orchestration run finished with failures."
+	} else if decodeRunScope(run).Mode == runModeRerunSelected {
+		outstandingFailed, err := taskHasOutstandingFailedStages(task.ID)
+		if err != nil {
+			log.Printf("warning: failed to inspect remaining failed stages for task %s: %v", task.ID, err)
+			outstandingFailed = true
+		}
+		if outstandingFailed {
+			taskStatus = "failed"
+			message = "Orchestration run completed, but the task still has unresolved failed stages outside the rerun scope."
+		}
 	}
 
 	if err := database.DB.Transaction(func(tx *gorm.DB) error {

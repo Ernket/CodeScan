@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -772,11 +773,11 @@ func TestDriveRunRepairsLegacyOrphansAndConvergesRunToFailed(t *testing.T) {
 			}).Error
 		case subtaskID == injection.ID && role == rolePersistence:
 			_ = database.DB.Model(&model.TaskSubtask{}).Where("id = ?", subtaskID).Updates(map[string]any{
-				"status":              subtaskStatusFailed,
-				"persistence_status":  roleStatusFailed,
-				"error_message":       "injection persistence retry failed",
-				"completed_at":        &terminalAt,
-				"updated_at":          terminalAt,
+				"status":             subtaskStatusFailed,
+				"persistence_status": roleStatusFailed,
+				"error_message":      "injection persistence retry failed",
+				"completed_at":       &terminalAt,
+				"updated_at":         terminalAt,
 			}).Error
 		case subtaskID == configSubtask.ID && role == rolePersistence:
 			_ = database.DB.Model(&model.TaskSubtask{}).Where("id = ?", subtaskID).Updates(map[string]any{
@@ -826,6 +827,15 @@ func TestDriveRunRepairsLegacyOrphansAndConvergesRunToFailed(t *testing.T) {
 func setupOrchestrationServiceTestDB(t *testing.T) {
 	t.Helper()
 
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	testWD := t.TempDir()
+	if err := os.Chdir(testWD); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+
 	previousDB := database.DB
 	dbPath := filepath.Join(t.TempDir(), "orchestration-test.sqlite")
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
@@ -856,6 +866,7 @@ func setupOrchestrationServiceTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		database.DB = previousDB
 		_ = sqlDB.Close()
+		_ = os.Chdir(previousWD)
 	})
 }
 

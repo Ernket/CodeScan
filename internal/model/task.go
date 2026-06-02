@@ -9,16 +9,24 @@ import (
 )
 
 type Task struct {
-	ID         string          `json:"id" gorm:"type:varchar(64);primaryKey"`
-	Name       string          `json:"name"`
-	Remark     string          `json:"remark"`
-	Status     string          `json:"status"` // pending, running, completed, failed, paused
-	CreatedAt  time.Time       `json:"created_at"`
-	BasePath   string          `json:"-" gorm:"-"` // Runtime only, not persisted
-	Result     string          `json:"result" gorm:"type:longtext"`
-	OutputJSON json.RawMessage `json:"output_json" gorm:"type:json"`          // Structured output
-	Logs       []string        `json:"logs" gorm:"type:json;serializer:json"` // Activity logs
-	Stages     []TaskStage     `json:"stages" gorm:"foreignKey:TaskID"`
+	ID             string          `json:"id" gorm:"type:varchar(64);primaryKey"`
+	Name           string          `json:"name"`
+	Remark         string          `json:"remark"`
+	Status         string          `json:"status"` // pending, running, completed, failed, paused
+	OrganizationID *uint           `json:"organization_id,omitempty" gorm:"index"`
+	Organization   *Organization   `json:"organization,omitempty" gorm:"foreignKey:OrganizationID"`
+	Permissions    TaskPermissions `json:"permissions" gorm:"-"`
+	CreatedAt      time.Time       `json:"created_at"`
+	BasePath       string          `json:"-" gorm:"-"` // Runtime only, not persisted
+	Result         string          `json:"result" gorm:"type:longtext"`
+	OutputJSON     json.RawMessage `json:"output_json" gorm:"type:longtext"`          // Structured output
+	Logs           []string        `json:"logs" gorm:"type:longtext;serializer:json"` // Activity logs
+	Stages         []TaskStage     `json:"stages" gorm:"foreignKey:TaskID"`
+}
+
+type TaskPermissions struct {
+	CanRead  bool `json:"can_read"`
+	CanWrite bool `json:"can_write"`
 }
 
 type TaskStageMeta struct {
@@ -57,9 +65,9 @@ type TaskStage struct {
 	Name       string          `json:"name"`   // e.g., "Scan", "Audit", "Fix"
 	Status     string          `json:"status"` // pending, running, completed, failed
 	Result     string          `json:"result" gorm:"type:longtext"`
-	OutputJSON json.RawMessage `json:"output_json" gorm:"type:json"`          // Structured output for frontend
-	Logs       []string        `json:"logs" gorm:"type:json;serializer:json"` // Stage specific logs
-	Meta       TaskStageMeta   `json:"meta" gorm:"type:json;serializer:json"`
+	OutputJSON json.RawMessage `json:"output_json" gorm:"type:longtext"`          // Structured output for frontend
+	Logs       []string        `json:"logs" gorm:"type:longtext;serializer:json"` // Stage specific logs
+	Meta       TaskStageMeta   `json:"meta" gorm:"type:longtext;serializer:json"`
 	CreatedAt  time.Time       `json:"created_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`
 }

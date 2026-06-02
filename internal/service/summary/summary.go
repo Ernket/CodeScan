@@ -39,16 +39,19 @@ type Stats struct {
 }
 
 type TaskListItem struct {
-	ID                  string    `json:"id"`
-	Name                string    `json:"name"`
-	Remark              string    `json:"remark"`
-	Status              string    `json:"status"`
-	CreatedAt           time.Time `json:"created_at"`
-	RouteCount          int       `json:"route_count"`
-	FindingCount        int       `json:"finding_count"`
-	CompletedStageCount int       `json:"completed_stage_count"`
-	TotalStageCount     int       `json:"total_stage_count"`
-	HighestSeverity     string    `json:"highest_severity"`
+	ID                  string                `json:"id"`
+	Name                string                `json:"name"`
+	Remark              string                `json:"remark"`
+	Status              string                `json:"status"`
+	OrganizationID      *uint                 `json:"organization_id,omitempty"`
+	Organization        *model.Organization   `json:"organization,omitempty"`
+	Permissions         model.TaskPermissions `json:"permissions"`
+	CreatedAt           time.Time             `json:"created_at"`
+	RouteCount          int                   `json:"route_count"`
+	FindingCount        int                   `json:"finding_count"`
+	CompletedStageCount int                   `json:"completed_stage_count"`
+	TotalStageCount     int                   `json:"total_stage_count"`
+	HighestSeverity     string                `json:"highest_severity"`
 }
 
 type stageDefinition struct {
@@ -184,6 +187,9 @@ func BuildTaskListItem(task model.Task) TaskListItem {
 		Name:                task.Name,
 		Remark:              task.Remark,
 		Status:              task.Status,
+		OrganizationID:      task.OrganizationID,
+		Organization:        task.Organization,
+		Permissions:         task.Permissions,
 		CreatedAt:           task.CreatedAt,
 		RouteCount:          ParseRouteCount(task.OutputJSON, task.Result),
 		FindingCount:        findingCount,

@@ -2,9 +2,14 @@
 /.cache/
 /bin/
 /release/
+/tmp/
+/temp/
+/coverage/
+/coverage.out
 
 # User-uploaded audit targets
 /projects/
+**/.codescan/runtime/
 
 # Frontend dependencies and build output
 /frontend/node_modules/
@@ -16,6 +21,14 @@
 /data/config.json
 /data/tasks.json
 /data/*.db
+/data/*.sqlite
+/data/*.sqlite3
+/data/*.db-shm
+/data/*.db-wal
+/data/*.sqlite-shm
+/data/*.sqlite-wal
+/data/*.sqlite3-shm
+/data/*.sqlite3-wal
 
 # Local environment files
 .env
@@ -28,6 +41,14 @@
 *.zip
 *.log
 *-report-*.html
+
+# Local editor and OS files
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 
 # Local analysis/design notes that should stay out of OSS repo
 /CONTEXT_COMPRESSION_IMPLEMENTATION.md

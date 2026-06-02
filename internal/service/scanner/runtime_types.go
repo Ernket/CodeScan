@@ -38,17 +38,18 @@ type compactBoundary struct {
 }
 
 type transcriptMessage struct {
-	ID         string            `json:"id"`
-	ParentID   string            `json:"parent_id,omitempty"`
-	Role       string            `json:"role"`
-	Kind       string            `json:"kind"`
-	Content    string            `json:"content,omitempty"`
-	ToolCalls  []runtimeToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string            `json:"tool_call_id,omitempty"`
-	ToolName   string            `json:"tool_name,omitempty"`
-	ArtifactID string            `json:"artifact_id,omitempty"`
-	Boundary   *compactBoundary  `json:"boundary,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
+	ID               string            `json:"id"`
+	ParentID         string            `json:"parent_id,omitempty"`
+	Role             string            `json:"role"`
+	Kind             string            `json:"kind"`
+	Content          string            `json:"content,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	ToolCalls        []runtimeToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	ToolName         string            `json:"tool_name,omitempty"`
+	ArtifactID       string            `json:"artifact_id,omitempty"`
+	Boundary         *compactBoundary  `json:"boundary,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
 }
 
 type microcompactRecord struct {
@@ -64,26 +65,27 @@ type runtimeMicrocompactState struct {
 }
 
 type runtimeState struct {
-	Version                   int                      `json:"version"`
-	TaskID                    string                   `json:"task_id"`
-	Stage                     string                   `json:"stage"`
-	Status                    string                   `json:"status"`
-	ActiveBoundaryID          string                   `json:"active_boundary_id,omitempty"`
-	LastCompactSummaryID      string                   `json:"last_compact_summary_id,omitempty"`
-	LastMemoryMessageID       string                   `json:"last_memory_message_id,omitempty"`
-	LastMessageID             string                   `json:"last_message_id,omitempty"`
-	NextMessageID             int                      `json:"next_message_id"`
-	NextArtifactID            int                      `json:"next_artifact_id"`
-	NextEvidenceID            int                      `json:"next_evidence_id"`
-	ArtifactOrder             []string                 `json:"artifact_order,omitempty"`
-	RollingSummary            string                   `json:"rolling_summary,omitempty"`
-	LastMemoryAttemptAt       time.Time                `json:"last_memory_attempt_at,omitempty"`
-	LastMemoryFailureAt       time.Time                `json:"last_memory_failure_at,omitempty"`
-	LastMemoryCooldownLogAt   time.Time                `json:"last_memory_cooldown_log_at,omitempty"`
-	MemoryUpdatedAt           time.Time                `json:"memory_updated_at,omitempty"`
-	ConsecutiveMemoryFailures int                      `json:"consecutive_memory_failures,omitempty"`
-	Microcompact              runtimeMicrocompactState `json:"microcompact"`
-	UpdatedAt                 time.Time                `json:"updated_at"`
+	Version                    int                      `json:"version"`
+	TaskID                     string                   `json:"task_id"`
+	Stage                      string                   `json:"stage"`
+	Status                     string                   `json:"status"`
+	ActiveBoundaryID           string                   `json:"active_boundary_id,omitempty"`
+	LastCompactSummaryID       string                   `json:"last_compact_summary_id,omitempty"`
+	LastMemoryMessageID        string                   `json:"last_memory_message_id,omitempty"`
+	LastMessageID              string                   `json:"last_message_id,omitempty"`
+	NextMessageID              int                      `json:"next_message_id"`
+	NextArtifactID             int                      `json:"next_artifact_id"`
+	NextEvidenceID             int                      `json:"next_evidence_id"`
+	ArtifactOrder              []string                 `json:"artifact_order,omitempty"`
+	RollingSummary             string                   `json:"rolling_summary,omitempty"`
+	LastMemoryAttemptAt        time.Time                `json:"last_memory_attempt_at,omitempty"`
+	LastMemoryFailureAt        time.Time                `json:"last_memory_failure_at,omitempty"`
+	LastMemoryCooldownLogAt    time.Time                `json:"last_memory_cooldown_log_at,omitempty"`
+	MemoryUpdatedAt            time.Time                `json:"memory_updated_at,omitempty"`
+	ConsecutiveMemoryFailures  int                      `json:"consecutive_memory_failures,omitempty"`
+	ConsecutiveCompactFailures int                      `json:"consecutive_compact_failures,omitempty"`
+	Microcompact               runtimeMicrocompactState `json:"microcompact"`
+	UpdatedAt                  time.Time                `json:"updated_at"`
 }
 
 type runtimeArtifact struct {

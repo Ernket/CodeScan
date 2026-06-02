@@ -12,7 +12,7 @@ type TaskRun struct {
 	PlannerRevision  int             `json:"planner_revision"`
 	PlannerPending   bool            `json:"planner_pending"`
 	LastReplanReason string          `json:"last_replan_reason" gorm:"type:varchar(128)"`
-	SummaryJSON      json.RawMessage `json:"summary_json" gorm:"type:json"`
+	SummaryJSON      json.RawMessage `json:"summary_json" gorm:"type:longtext"`
 	ErrorMessage     string          `json:"error_message" gorm:"type:longtext"`
 	StartedAt        time.Time       `json:"started_at"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
@@ -39,7 +39,7 @@ type TaskSubtask struct {
 	ProvisionalCount   int             `json:"provisional_count"`
 	ValidatedCount     int             `json:"validated_count"`
 	VerificationStatus string          `json:"verification_status" gorm:"type:varchar(32)"`
-	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:json"`
+	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:longtext"`
 	StartedAt          *time.Time      `json:"started_at,omitempty"`
 	CompletedAt        *time.Time      `json:"completed_at,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -59,8 +59,8 @@ type TaskAgentRun struct {
 	MaxIterations int             `json:"max_iterations"`
 	ResumeCount   int             `json:"resume_count"`
 	SessionPath   string          `json:"session_path" gorm:"type:longtext"`
-	InputJSON     json.RawMessage `json:"input_json" gorm:"type:json"`
-	OutputJSON    json.RawMessage `json:"output_json" gorm:"type:json"`
+	InputJSON     json.RawMessage `json:"input_json" gorm:"type:longtext"`
+	OutputJSON    json.RawMessage `json:"output_json" gorm:"type:longtext"`
 	ErrorMessage  string          `json:"error_message" gorm:"type:longtext"`
 	StartedAt     *time.Time      `json:"started_at,omitempty"`
 	CompletedAt   *time.Time      `json:"completed_at,omitempty"`
@@ -78,7 +78,7 @@ type TaskEvent struct {
 	EventType   string          `json:"event_type" gorm:"type:varchar(64);index"`
 	Level       string          `json:"level" gorm:"type:varchar(16)"`
 	Message     string          `json:"message" gorm:"type:longtext"`
-	PayloadJSON json.RawMessage `json:"payload_json" gorm:"type:json"`
+	PayloadJSON json.RawMessage `json:"payload_json" gorm:"type:longtext"`
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
@@ -97,8 +97,8 @@ type TaskRoute struct {
 	VerificationStatus string          `json:"verification_status" gorm:"type:varchar(32)"`
 	ReviewedSeverity   string          `json:"reviewed_severity" gorm:"type:varchar(32)"`
 	VerificationReason string          `json:"verification_reason" gorm:"type:longtext"`
-	EvidenceRefs       json.RawMessage `json:"evidence_refs" gorm:"type:json"`
-	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:json"`
+	EvidenceRefs       json.RawMessage `json:"evidence_refs" gorm:"type:longtext"`
+	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:longtext"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
@@ -117,8 +117,8 @@ type TaskFinding struct {
 	VerificationStatus string          `json:"verification_status" gorm:"type:varchar(32);index"`
 	ReviewedSeverity   string          `json:"reviewed_severity" gorm:"type:varchar(32)"`
 	VerificationReason string          `json:"verification_reason" gorm:"type:longtext"`
-	EvidenceRefs       json.RawMessage `json:"evidence_refs" gorm:"type:json"`
-	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:json"`
+	EvidenceRefs       json.RawMessage `json:"evidence_refs" gorm:"type:longtext"`
+	PayloadJSON        json.RawMessage `json:"payload_json" gorm:"type:longtext"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }

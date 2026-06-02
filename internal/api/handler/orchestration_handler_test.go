@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"codescan/internal/model"
 	"codescan/internal/service/orchestration"
@@ -95,30 +98,116 @@ func TestOrchestrationEventsHandlerStreamsHistoryForExistingTask(t *testing.T) {
 	}
 }
 
+func TestRerunOrchestrationHandlerRejectsInvalidStageSelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	restore := setOrchestrationHandlerTestDeps(t, orchestrationHandlerTestDeps{
+		taskExists: func(string) (bool, error) {
+			return true, nil
+		},
+		rerun: func(string, []string) (*orchestration.Snapshot, error) {
+			t.Fatalf("rerun should not be called for invalid stage selection")
+			return nil, nil
+		},
+	})
+	defer restore()
+
+	body := bytes.NewBufferString(`{"selected_stages":["bogus"]}`)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/tasks/task-1/orchestration/rerun", body)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "task-1"}}
+
+	RerunOrchestrationHandler(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+func TestRerunOrchestrationHandlerStartsSelectedStages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	called := false
+	restore := setOrchestrationHandlerTestDeps(t, orchestrationHandlerTestDeps{
+		taskExists: func(string) (bool, error) {
+			return true, nil
+		},
+		rerun: func(taskID string, stages []string) (*orchestration.Snapshot, error) {
+			called = true
+			if taskID != "task-1" {
+				t.Fatalf("expected task-1, got %s", taskID)
+			}
+			if len(stages) != 2 || stages[0] != "auth" || stages[1] != "xss" {
+				t.Fatalf("unexpected stage selection: %+v", stages)
+			}
+			return &orchestration.Snapshot{UpdatedAt: nowForTest()}, nil
+		},
+	})
+	defer restore()
+
+	body, _ := json.Marshal(map[string]any{
+		"selected_stages": []string{"auth", "xss"},
+	})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/tasks/task-1/orchestration/rerun", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "task-1"}}
+
+	RerunOrchestrationHandler(c)
+
+	if !called {
+		t.Fatal("expected rerun service to be called")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
 type orchestrationHandlerTestDeps struct {
-	taskExists   func(taskID string) (bool, error)
-	loadSnapshot func(taskID string) (*orchestration.Snapshot, error)
-	loadSubtasks func(taskID string) ([]model.TaskSubtask, error)
-	loadAgents   func(taskID string) ([]model.TaskAgentRun, error)
-	loadEvents   func(taskID string, after uint64, limit int) ([]model.TaskEvent, error)
-	subscribe    func(taskID string) (<-chan model.TaskEvent, func())
+	taskExists     func(taskID string) (bool, error)
+	authorizeRead  func(c *gin.Context, taskID string) bool
+	authorizeWrite func(c *gin.Context, taskID string) (model.Task, bool)
+	loadSnapshot   func(taskID string) (*orchestration.Snapshot, error)
+	loadSubtasks   func(taskID string) ([]model.TaskSubtask, error)
+	loadAgents     func(taskID string) ([]model.TaskAgentRun, error)
+	loadEvents     func(taskID string, after uint64, limit int) ([]model.TaskEvent, error)
+	subscribe      func(taskID string) (<-chan model.TaskEvent, func())
+	rerun          func(taskID string, stages []string) (*orchestration.Snapshot, error)
 }
 
 func setOrchestrationHandlerTestDeps(t *testing.T, deps orchestrationHandlerTestDeps) func() {
 	t.Helper()
 
 	oldTaskExists := taskExistsForOrchestration
+	oldAuthorizeRead := authorizeOrchestrationTaskRead
+	oldAuthorizeWrite := authorizeOrchestrationTaskWrite
 	oldLoadSnapshot := loadOrchestrationSnapshot
 	oldLoadSubtasks := loadOrchestrationSubtasks
 	oldLoadAgents := loadOrchestrationAgents
 	oldLoadEvents := loadOrchestrationEvents
 	oldSubscribe := subscribeOrchestrationEvents
+	oldRerun := rerunTaskOrchestration
 
 	taskExistsForOrchestration = func(taskID string) (bool, error) {
 		if deps.taskExists != nil {
 			return deps.taskExists(taskID)
 		}
 		return true, nil
+	}
+	authorizeOrchestrationTaskRead = func(c *gin.Context, taskID string) bool {
+		if deps.authorizeRead != nil {
+			return deps.authorizeRead(c, taskID)
+		}
+		return true
+	}
+	authorizeOrchestrationTaskWrite = func(c *gin.Context, taskID string) (model.Task, bool) {
+		if deps.authorizeWrite != nil {
+			return deps.authorizeWrite(c, taskID)
+		}
+		return model.Task{ID: taskID, Status: "pending"}, true
 	}
 	loadOrchestrationSnapshot = func(taskID string) (*orchestration.Snapshot, error) {
 		if deps.loadSnapshot != nil {
@@ -152,13 +241,26 @@ func setOrchestrationHandlerTestDeps(t *testing.T, deps orchestrationHandlerTest
 		close(ch)
 		return ch, func() {}
 	}
+	rerunTaskOrchestration = func(taskID string, stages []string) (*orchestration.Snapshot, error) {
+		if deps.rerun != nil {
+			return deps.rerun(taskID, stages)
+		}
+		return &orchestration.Snapshot{}, nil
+	}
 
 	return func() {
 		taskExistsForOrchestration = oldTaskExists
+		authorizeOrchestrationTaskRead = oldAuthorizeRead
+		authorizeOrchestrationTaskWrite = oldAuthorizeWrite
 		loadOrchestrationSnapshot = oldLoadSnapshot
 		loadOrchestrationSubtasks = oldLoadSubtasks
 		loadOrchestrationAgents = oldLoadAgents
 		loadOrchestrationEvents = oldLoadEvents
 		subscribeOrchestrationEvents = oldSubscribe
+		rerunTaskOrchestration = oldRerun
 	}
+}
+
+func nowForTest() time.Time {
+	return time.Unix(10, 0)
 }

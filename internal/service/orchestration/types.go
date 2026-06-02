@@ -49,6 +49,7 @@ const (
 	eventRunFailed            = "run.failed"
 	eventPlannerRevised       = "planner.revised"
 	eventAgentStarted         = "agent.started"
+	eventAgentUpdated         = "agent.updated"
 	eventAgentCompleted       = "agent.completed"
 	eventAgentPaused          = "agent.paused"
 	eventAgentFailed          = "agent.failed"
@@ -80,23 +81,27 @@ type RunSummary struct {
 }
 
 type SnapshotDiagnostics struct {
-	FocusStatus        string      `json:"focus_status"`
-	FocusReason        string      `json:"focus_reason,omitempty"`
-	CurrentStage       string      `json:"current_stage,omitempty"`
-	CurrentRole        string      `json:"current_role,omitempty"`
-	FocusSubtaskID     string      `json:"focus_subtask_id,omitempty"`
-	FocusSubtaskTitle  string      `json:"focus_subtask_title,omitempty"`
-	BlockedReason      string      `json:"blocked_reason,omitempty"`
-	ErrorMessage       string      `json:"error_message,omitempty"`
-	LastProgressAt     *time.Time  `json:"last_progress_at,omitempty"`
-	SilenceSeconds     int64       `json:"silence_seconds"`
-	LatestEventType    string      `json:"latest_event_type,omitempty"`
-	LatestEventMessage string      `json:"latest_event_message,omitempty"`
-	LatestEventAt      *time.Time  `json:"latest_event_at,omitempty"`
-	PlannerPending     bool        `json:"planner_pending"`
-	LastReplanReason   string      `json:"last_replan_reason,omitempty"`
-	Stalled            bool        `json:"stalled"`
-	Parallelism        Parallelism `json:"parallelism"`
+	FocusStatus           string      `json:"focus_status"`
+	FocusReason           string      `json:"focus_reason,omitempty"`
+	CurrentStage          string      `json:"current_stage,omitempty"`
+	CurrentRole           string      `json:"current_role,omitempty"`
+	FocusSubtaskID        string      `json:"focus_subtask_id,omitempty"`
+	FocusSubtaskTitle     string      `json:"focus_subtask_title,omitempty"`
+	BlockedReason         string      `json:"blocked_reason,omitempty"`
+	ErrorMessage          string      `json:"error_message,omitempty"`
+	LastProgressAt        *time.Time  `json:"last_progress_at,omitempty"`
+	SilenceSeconds        int64       `json:"silence_seconds"`
+	StallThresholdSeconds int64       `json:"stall_threshold_seconds"`
+	StallCandidateSince   *time.Time  `json:"stall_candidate_since,omitempty"`
+	FocusSilenceSeconds   int64       `json:"focus_silence_seconds"`
+	ActiveAgentRunID      string      `json:"active_agent_run_id,omitempty"`
+	LatestEventType       string      `json:"latest_event_type,omitempty"`
+	LatestEventMessage    string      `json:"latest_event_message,omitempty"`
+	LatestEventAt         *time.Time  `json:"latest_event_at,omitempty"`
+	PlannerPending        bool        `json:"planner_pending"`
+	LastReplanReason      string      `json:"last_replan_reason,omitempty"`
+	Stalled               bool        `json:"stalled"`
+	Parallelism           Parallelism `json:"parallelism"`
 }
 
 type Parallelism struct {
@@ -125,6 +130,11 @@ type TaskSummary struct {
 	StageProgress      []StageProgress `json:"stage_progress"`
 	LastRunStatus      string          `json:"last_run_status,omitempty"`
 	LastReplanReason   string          `json:"last_replan_reason,omitempty"`
+	FocusStatus        string          `json:"focus_status,omitempty"`
+	CurrentStage       string          `json:"current_stage,omitempty"`
+	LastProgressAt     *time.Time      `json:"last_progress_at,omitempty"`
+	LatestEventAt      *time.Time      `json:"latest_event_at,omitempty"`
+	LatestEventMessage string          `json:"latest_event_message,omitempty"`
 }
 
 func auditStages() []string {

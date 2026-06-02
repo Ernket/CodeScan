@@ -44,12 +44,12 @@ func main() {
 		cfg = loaded
 	}
 
-	// 3. Setup Auth Key
+	// 3. Setup token signing key
 	if cfg.AuthKey == "" {
-		fmt.Println("Generating new Auth Key...")
+		fmt.Println("Generating new token signing key...")
 		cfg.AuthKey = strings.ReplaceAll(uuid.New().String(), "-", "")
 	} else {
-		fmt.Println("Existing Auth Key found.")
+		fmt.Println("Existing token signing key found.")
 	}
 
 	// 4. Setup Database Config (Interactive or Defaults)
@@ -122,10 +122,27 @@ func main() {
 		}
 	}
 
+	adminResult, err := database.EnsureDefaultSuperAdmin(db)
+	if err != nil {
+		fmt.Printf("Error ensuring default super admin: %v\n", err)
+		return
+	}
+
 	fmt.Println("==================================================")
-	fmt.Printf("AUTH KEY: %s\n", cfg.AuthKey)
+	fmt.Printf("TOKEN SIGNING KEY: %s\n", cfg.AuthKey)
 	fmt.Printf("DB Host: %s:%d\n", cfg.DBConfig.Host, cfg.DBConfig.Port)
 	fmt.Printf("DB Name: %s\n", cfg.DBConfig.DBName)
+	if adminResult.Created || adminResult.Updated {
+		fmt.Printf("SUPER ADMIN USERNAME: %s\n", adminResult.Username)
+		if adminResult.GeneratedPassword {
+			fmt.Printf("GENERATED SUPER ADMIN PASSWORD: %s\n", adminResult.Password)
+			fmt.Println("Store this password now; it will not be shown again.")
+		} else {
+			fmt.Println("SUPER ADMIN PASSWORD: loaded from CODESCAN_ADMIN_PASSWORD")
+		}
+	} else {
+		fmt.Println("SUPER ADMIN: existing account found; password unchanged.")
+	}
 	fmt.Println("==================================================")
 	fmt.Println("Initialization Complete.")
 }

@@ -9,12 +9,17 @@
   "ai_config": {
     "api_key": "replace-with-api-key",
     "base_url": "https://api.openai.com/v1",
-    "model": "gpt-5.4"
+    "model": "gpt-5.4",
+    "thinking": {
+      "enabled": true,
+      "effort": "high",
+      "max_completion_tokens": 20000,
+      "apply_to_auxiliary": true
+    }
   },
   "scanner_config": {
     "context_compression": {
-      "soft_limit_tokens": 40000,
-      "hard_limit_tokens": 200000
+      "context_window_tokens": 128000
     },
     "session_memory": {
       "enabled": true

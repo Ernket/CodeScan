@@ -46,6 +46,10 @@ const props = defineProps({
     type: Function,
     required: true,
   },
+  canDelete: {
+    type: Boolean,
+    default: false,
+  },
 })
 
 const emit = defineEmits(['refresh', 'open-task', 'delete-task'])
@@ -226,6 +230,10 @@ function coverageLabel(task) {
   return `${task.completed_stage_count || 0}/${task.total_stage_count || 0}`
 }
 
+function organizationLabel(task) {
+  return task.organization?.name || props.t('common.unassigned')
+}
+
 function submittedLabel(value) {
   const intlLocale = props.locale === 'en' ? 'en-US' : 'zh-CN'
   return new Date(value).toLocaleString(intlLocale)
@@ -344,10 +352,11 @@ function submittedLabel(value) {
       </div>
 
       <div class="overflow-x-auto">
-        <table class="w-full text-left min-w-[980px]">
+        <table class="w-full text-left min-w-[1080px]">
           <thead class="bg-black/20 text-slate-400 uppercase text-xs font-semibold tracking-wider">
             <tr>
               <th class="px-6 py-4">{{ t('common.project') }}</th>
+              <th class="px-6 py-4">{{ t('dashboard.organization') }}</th>
               <th class="px-6 py-4">{{ t('common.status') }}</th>
               <th class="px-6 py-4">{{ t('common.routes') }}</th>
               <th class="px-6 py-4">{{ t('common.findings') }}</th>
@@ -376,6 +385,11 @@ function submittedLabel(value) {
                 </div>
               </td>
               <td class="px-6 py-4">
+                <span class="inline-flex max-w-44 items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
+                  <span class="truncate">{{ organizationLabel(task) }}</span>
+                </span>
+              </td>
+              <td class="px-6 py-4">
                 <div :class="['inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold uppercase', statusBadgeClass(task.status)]">
                   <span v-if="task.status === 'running'" class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
                   {{ displayStatus(task.status) }}
@@ -402,7 +416,7 @@ function submittedLabel(value) {
                   <button @click="emit('open-task', task)" class="p-2 hover:bg-cyan-500/20 text-cyan-300 rounded-lg transition-colors" :title="t('dashboard.viewDetails')">
                     <ChevronRight class="w-4 h-4" />
                   </button>
-                  <button @click="emit('delete-task', task.id)" class="p-2 hover:bg-rose-500/20 text-rose-300 rounded-lg transition-colors" :title="t('common.delete')">
+                  <button v-if="canDelete" @click="emit('delete-task', task.id)" class="p-2 hover:bg-rose-500/20 text-rose-300 rounded-lg transition-colors" :title="t('common.delete')">
                     <Trash2 class="w-4 h-4" />
                   </button>
                 </div>
@@ -411,7 +425,7 @@ function submittedLabel(value) {
           </tbody>
           <tbody v-else>
             <tr>
-              <td colspan="8" class="px-6 py-16 text-center text-slate-500">
+              <td colspan="9" class="px-6 py-16 text-center text-slate-500">
                 <div v-if="loading" class="flex flex-col items-center gap-4">
                   <div class="w-12 h-12 rounded-full border-2 border-cyber-primary/20 border-t-cyber-primary animate-spin"></div>
                   <p>{{ t('dashboard.loadingProjectSummaries') }}</p>
@@ -430,4 +444,3 @@ function submittedLabel(value) {
     </section>
   </div>
 </template>
-

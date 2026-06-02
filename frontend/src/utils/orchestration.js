@@ -1,6 +1,7 @@
 export const ORCHESTRATION_STAGE_ORDER = ['init', 'rce', 'injection', 'auth', 'access', 'xss', 'config', 'fileop', 'logic']
 export const ORCHESTRATION_AUDIT_STAGE_ORDER = ORCHESTRATION_STAGE_ORDER.filter((stage) => stage !== 'init')
 export const ORCHESTRATION_ROLE_ORDER = ['worker', 'integrator', 'validator', 'persistence']
+export const TASK_MAIN_VIEWS = ['task-detail', 'task-orchestration', 'task-report']
 
 const ROUTE_INVENTORY_WAIT = 'waiting for route inventory'
 const stageOrderIndex = Object.fromEntries(ORCHESTRATION_STAGE_ORDER.map((stage, index) => [stage, index]))
@@ -18,9 +19,10 @@ const subtaskDisplayPriority = {
   starting: 0,
   running: 1,
   blocked: 2,
-  paused: 3,
-  failed: 4,
+  failed: 3,
+  paused: 4,
   ready: 5,
+  waiting: 6,
   completed: 6,
 }
 
@@ -56,12 +58,125 @@ export function buildStageMatrixRows(snapshot, diagnostics, t) {
   })
 }
 
+export function buildOrchestrationFlow(snapshot, diagnostics, t) {
+  const nodes = buildStageNodes(snapshot, diagnostics, t)
+  const subtasksByStage = groupByStage(snapshot?.subtasks || [])
+  const init = enrichFlowNode(nodes.find((node) => node.stage === 'init') || buildFallbackStageNode('init', t), subtasksByStage, diagnostics, t)
+  const initComplete = init.status === 'completed'
+  const auditStages = nodes
+    .filter((node) => node.stage !== 'init')
+    .map((node) => enrichFlowNode(node, subtasksByStage, diagnostics, t, { initComplete }))
+
+  const activeStageCount = auditStages.filter((node) => ['starting', 'running', 'stalled'].includes(node.status)).length + (['starting', 'running', 'stalled'].includes(init.status) ? 1 : 0)
+  const queuedUnitCount = auditStages.reduce((total, node) => total + node.readyCount, 0) + init.readyCount
+  const waitingUnitCount = auditStages.reduce((total, node) => total + node.waitingCount, 0) + init.waitingCount
+  const completedStageCount = auditStages.filter((node) => node.status === 'completed').length + (init.status === 'completed' ? 1 : 0)
+
+  return {
+    init,
+    auditStages,
+    hasRun: Boolean(snapshot?.run),
+    activeStageCount,
+    queuedUnitCount,
+    waitingUnitCount,
+    completedStageCount,
+    totalStageCount: ORCHESTRATION_STAGE_ORDER.length,
+  }
+}
+
+export function buildExecutionQueues(snapshot, diagnostics, t) {
+  const subtasks = sortStageSubtasks(snapshot?.subtasks || [], diagnostics)
+  const active = []
+  const ready = []
+  const waiting = []
+  const blocked = []
+
+  for (const subtask of subtasks) {
+    const stageStatus = normalizeStageStateLabel(subtask?.status)
+    if (isIssueSubtask(subtask)) {
+      blocked.push(buildExecutionUnit(subtask, '', stageStatus === 'failed' ? 'failed' : 'blocked', diagnostics, t))
+      continue
+    }
+    if (isDependencyWaitingSubtask(subtask)) {
+      waiting.push(buildExecutionUnit(subtask, '', 'waiting', diagnostics, t))
+      continue
+    }
+
+    let hasVisibleRoleUnit = false
+    for (const role of ORCHESTRATION_ROLE_ORDER) {
+      const status = normalizeRoleState(subtask?.[`${role}_status`])
+      if (isActiveRoleStatus(status)) {
+        active.push(buildExecutionUnit(subtask, role, status, diagnostics, t))
+        hasVisibleRoleUnit = true
+      } else if (isQueuedRoleStatus(role, status)) {
+        ready.push(buildExecutionUnit(subtask, role, status, diagnostics, t))
+        hasVisibleRoleUnit = true
+      }
+    }
+
+    if (!hasVisibleRoleUnit && stageStatus !== 'completed') {
+      waiting.push(buildExecutionUnit(subtask, '', 'waiting', diagnostics, t))
+    }
+  }
+
+  active.sort(executionUnitSort)
+  ready.sort(executionUnitSort)
+  waiting.sort(executionUnitSort)
+  blocked.sort(executionUnitSort)
+  ready.forEach((unit, index) => {
+    unit.position = index + 1
+  })
+  waiting.forEach((unit, index) => {
+    unit.position = index + 1
+  })
+
+  const roleQueues = ['planner', ...ORCHESTRATION_ROLE_ORDER].map((role) => {
+    if (role === 'planner') {
+      const plannerActive = Boolean(diagnostics?.planner_pending || snapshot?.run?.run?.planner_pending)
+      return {
+        role,
+        label: t('orchestration.roles.planner'),
+        parallelism: Number(diagnostics?.parallelism?.planner || 0),
+        active: plannerActive ? [buildPlannerUnit(snapshot, diagnostics, t)] : [],
+        ready: [],
+        waiting: [],
+        blocked: [],
+      }
+    }
+
+    return {
+      role,
+      label: t(`orchestration.roles.${role}`),
+      parallelism: Number(diagnostics?.parallelism?.[role] || 0),
+      active: active.filter((unit) => unit.role === role),
+      ready: ready.filter((unit) => unit.role === role),
+      waiting: waiting.filter((unit) => unit.role === role),
+      blocked: blocked.filter((unit) => unit.role === role || unit.stageStatus === 'blocked' || unit.stageStatus === 'failed'),
+    }
+  })
+
+  return {
+    roles: roleQueues,
+    active: roleQueues.flatMap((role) => role.active),
+    ready,
+    waiting,
+    blocked,
+    totals: {
+      active: roleQueues.reduce((total, role) => total + role.active.length, 0),
+      ready: ready.length,
+      waiting: waiting.length,
+      blocked: blocked.length,
+    },
+  }
+}
+
 export function pickDefaultStage(entries = []) {
   const ordered = Array.isArray(entries) ? entries : []
   const priorities = [
     ['blocked', 'stalled'],
     ['starting', 'running'],
     ['failed'],
+    ['waiting'],
   ]
 
   for (const states of priorities) {
@@ -97,7 +212,10 @@ export function buildRolePipeline(subtask, t) {
 
 export function resolveSubtaskDisplayStatus(subtask) {
   const status = normalizeStageStateLabel(subtask?.status)
-  if (['failed', 'paused', 'blocked', 'completed', 'stalled'].includes(status)) {
+  if (status === 'blocked' && !hasMeaningfulBlock(subtask?.blocked_reason) && !subtask?.error_message) {
+    return 'waiting'
+  }
+  if (['failed', 'paused', 'blocked', 'completed', 'stalled', 'waiting'].includes(status)) {
     return status
   }
 
@@ -151,6 +269,96 @@ export function formatReplanReason(reason, t) {
   return t(`orchestration.replan.${normalized}`)
 }
 
+export function pickDefaultRerunStages(task = null) {
+  const stages = Array.isArray(task?.stages) ? task.stages : []
+  const failedStages = stages
+    .map((stage) => ({
+      name: normalizeString(stage?.name).toLowerCase(),
+      status: normalizeString(stage?.status).toLowerCase(),
+    }))
+    .filter((stage) => stage.status === 'failed' && ORCHESTRATION_AUDIT_STAGE_ORDER.includes(stage.name))
+    .sort((left, right) => stageOrderIndex[left.name] - stageOrderIndex[right.name])
+    .map((stage) => stage.name)
+
+  const selected = [...new Set(failedStages)]
+  const taskStatus = normalizeString(task?.status).toLowerCase()
+  const routes = normalizeJsonValue(task?.output_json)
+  const hasRoutes = Array.isArray(routes) && routes.length > 0
+
+  if (taskStatus === 'failed' && !hasRoutes && !selected.includes('init')) {
+    selected.unshift('init')
+  }
+
+  return selected
+}
+
+export function parseRunScope(summaryJson) {
+  const payload = normalizeJsonValue(summaryJson)
+  const defaultScope = {
+    mode: 'full',
+    selectedStages: [...ORCHESTRATION_STAGE_ORDER],
+    carriedOverStages: [],
+    reusedRouteInventory: false,
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return defaultScope
+  }
+
+  const normalizeStages = (value) => {
+    const input = Array.isArray(value) ? value : []
+    const stages = input
+      .map((stage) => normalizeString(stage).toLowerCase())
+      .filter((stage) => ORCHESTRATION_STAGE_ORDER.includes(stage))
+    return [...new Set(stages)].sort((left, right) => stageOrderIndex[left] - stageOrderIndex[right])
+  }
+
+  const mode = normalizeString(payload.mode).toLowerCase() || 'full'
+  const selectedStages = normalizeStages(payload.selected_stages)
+  const carriedOverStages = normalizeStages(payload.carried_over_stages)
+
+  if (mode !== 'rerun_selected') {
+    return defaultScope
+  }
+
+  return {
+    mode,
+    selectedStages,
+    carriedOverStages,
+    reusedRouteInventory: Boolean(payload.reused_route_inventory),
+  }
+}
+
+export function isTaskMainView(view) {
+  return TASK_MAIN_VIEWS.includes(normalizeString(view))
+}
+
+export function buildTaskOrchestrationPreview(summary = null) {
+  if (!summary || typeof summary !== 'object') {
+    return {
+      hasRun: false,
+      focusStatus: 'not_started',
+      currentStage: '',
+      activeSubtaskCount: 0,
+      lastProgressAt: '',
+      latestEventAt: '',
+      latestEventMessage: '',
+      lastRunStatus: '',
+    }
+  }
+
+  return {
+    hasRun: true,
+    focusStatus: normalizeFocusStatus(summary.focus_status, summary.last_run_status),
+    currentStage: normalizeString(summary.current_stage),
+    activeSubtaskCount: Number(summary.active_subtask_count || 0),
+    lastProgressAt: normalizeTimestamp(summary.last_progress_at),
+    latestEventAt: normalizeTimestamp(summary.latest_event_at),
+    latestEventMessage: normalizeString(summary.latest_event_message),
+    lastRunStatus: normalizeRunStatus(summary.last_run_status),
+  }
+}
+
 export function findingSummary(finding, fallback) {
   const payload = normalizeJsonValue(finding?.payload_json)
   if (payload && typeof payload === 'object') {
@@ -178,10 +386,10 @@ function resolveStageStatus(stage, subtasks, diagnostics) {
 
   const blocked = subtasks.find((subtask) => String(subtask.status).toLowerCase() === 'blocked')
   if (blocked) {
-    if (subtasks.some((subtask) => hasMeaningfulBlock(subtask.blocked_reason)) || subtasks.some(hasSubtaskStarted)) {
+    if (subtasks.some(isIssueSubtask)) {
       return 'blocked'
     }
-    return 'not_started'
+    return 'waiting'
   }
 
   if (subtasks.every((subtask) => String(subtask.status).toLowerCase() === 'completed')) {
@@ -390,6 +598,175 @@ function buildStageOverview(stage, progressByStage, subtasksByStage, diagnostics
   }
 }
 
+function buildFallbackStageNode(stage, t) {
+  return {
+    stage,
+    label: t(stage === 'init' ? 'stage.init.label' : `stage.${stage}.shortLabel`),
+    fullLabel: t(stage === 'init' ? 'stage.init.label' : `stage.${stage}.label`),
+    status: 'not_started',
+    provisionalCount: 0,
+    validatedCount: 0,
+    runningCount: 0,
+    failedCount: 0,
+    completedCount: 0,
+    subtaskCount: 0,
+    isCurrent: false,
+  }
+}
+
+function enrichFlowNode(node, subtasksByStage, diagnostics, t, options = {}) {
+  const subtasks = subtasksByStage.get(node.stage) || []
+  const activeUnits = []
+  const readyUnits = []
+  const waitingUnits = []
+  let pendingCount = 0
+  let blockedCount = 0
+
+  for (const subtask of sortStageSubtasks(subtasks, diagnostics)) {
+    const subtaskStatus = normalizeStageStateLabel(subtask?.status)
+    if (isIssueSubtask(subtask)) {
+      blockedCount += 1
+      continue
+    }
+    if (isDependencyWaitingSubtask(subtask)) {
+      waitingUnits.push(buildExecutionUnit(subtask, '', 'waiting', diagnostics, t))
+      continue
+    }
+
+    let hasVisibleRoleUnit = false
+    for (const role of ORCHESTRATION_ROLE_ORDER) {
+      const status = normalizeRoleState(subtask?.[`${role}_status`])
+      if (isActiveRoleStatus(status)) {
+        activeUnits.push(buildExecutionUnit(subtask, role, status, diagnostics, t))
+        hasVisibleRoleUnit = true
+      } else if (isQueuedRoleStatus(role, status)) {
+        readyUnits.push(buildExecutionUnit(subtask, role, status, diagnostics, t))
+        hasVisibleRoleUnit = true
+      } else if (status === 'pending') {
+        pendingCount += 1
+      }
+    }
+
+    if (!hasVisibleRoleUnit && subtaskStatus !== 'completed') {
+      waitingUnits.push(buildExecutionUnit(subtask, '', 'waiting', diagnostics, t))
+    }
+  }
+
+  const locked = node.stage !== 'init' && !options.initComplete && ['not_started', 'waiting'].includes(node.status)
+  const progressPercent = node.subtaskCount > 0
+    ? Math.round((node.completedCount / node.subtaskCount) * 100)
+    : node.status === 'completed'
+      ? 100
+      : 0
+
+  return {
+    ...node,
+    locked,
+    progressPercent,
+    activeUnits,
+    readyUnits,
+    waitingUnits,
+    activeCount: activeUnits.length,
+    readyCount: readyUnits.length,
+    waitingCount: waitingUnits.length,
+    pendingCount,
+    blockedCount,
+    statusLabel: t(`orchestration.state.${normalizeStageStateLabel(node.status)}`),
+  }
+}
+
+function buildExecutionUnit(subtask, role, status, diagnostics, t) {
+  const stage = normalizeString(subtask?.stage)
+  const stageLabel = stage ? t(stage === 'init' ? 'stage.init.label' : `stage.${stage}.label`) : ''
+  const roleLabel = role ? t(`orchestration.roles.${role}`) : ''
+  const requestedStatus = normalizeStageStateLabel(status)
+  const stageStatus = requestedStatus === 'waiting' || isDependencyWaitingSubtask(subtask)
+    ? 'waiting'
+    : normalizeStageStateLabel(subtask?.status)
+
+  return {
+    id: [subtask?.id || 'subtask', role || stageStatus].filter(Boolean).join(':'),
+    subtaskId: subtask?.id || '',
+    title: normalizeString(subtask?.title) || stageLabel || subtask?.id || '',
+    stage,
+    stageLabel,
+    role,
+    roleLabel,
+    status,
+    statusLabel: role ? t(`orchestration.roleState.${status}`) : t(`orchestration.state.${stageStatus}`),
+    stageStatus,
+    priority: Number(subtask?.priority || 0),
+    isFocus: Boolean(subtask?.id && subtask.id === diagnostics?.focus_subtask_id),
+    blockedReason: normalizeString(subtask?.blocked_reason),
+    errorMessage: normalizeString(subtask?.error_message),
+    startedAt: normalizeString(subtask?.started_at),
+    updatedAt: normalizeString(subtask?.updated_at),
+    position: 0,
+  }
+}
+
+function buildPlannerUnit(snapshot, diagnostics, t) {
+  return {
+    id: 'planner:pending',
+    subtaskId: '',
+    title: diagnostics?.last_replan_reason
+      ? formatReplanReason(diagnostics.last_replan_reason, t)
+      : t('orchestration.queue.plannerPending'),
+    stage: diagnostics?.current_stage || '',
+    stageLabel: diagnostics?.current_stage ? t(diagnostics.current_stage === 'init' ? 'stage.init.label' : `stage.${diagnostics.current_stage}.label`) : '',
+    role: 'planner',
+    roleLabel: t('orchestration.roles.planner'),
+    status: 'running',
+    statusLabel: t('orchestration.state.running'),
+    stageStatus: normalizeFocusStatus(diagnostics?.focus_status, snapshot?.run?.run?.status),
+    priority: -1,
+    isFocus: diagnostics?.current_role === 'planner',
+    blockedReason: '',
+    errorMessage: '',
+    startedAt: '',
+    updatedAt: normalizeString(diagnostics?.latest_event_at),
+    position: 0,
+  }
+}
+
+function executionUnitSort(left, right) {
+  if (left.isFocus !== right.isFocus) return left.isFocus ? -1 : 1
+
+  const leftStage = stageOrderIndex[left.stage] ?? Number.MAX_SAFE_INTEGER
+  const rightStage = stageOrderIndex[right.stage] ?? Number.MAX_SAFE_INTEGER
+  if (leftStage !== rightStage) return leftStage - rightStage
+
+  if (left.priority !== right.priority) return left.priority - right.priority
+
+  const leftRole = ORCHESTRATION_ROLE_ORDER.indexOf(left.role)
+  const rightRole = ORCHESTRATION_ROLE_ORDER.indexOf(right.role)
+  const leftRoleIndex = leftRole === -1 ? Number.MAX_SAFE_INTEGER : leftRole
+  const rightRoleIndex = rightRole === -1 ? Number.MAX_SAFE_INTEGER : rightRole
+  if (leftRoleIndex !== rightRoleIndex) return leftRoleIndex - rightRoleIndex
+
+  return left.id.localeCompare(right.id)
+}
+
+function isActiveRoleStatus(status) {
+  return status === 'starting' || status === 'running'
+}
+
+function isQueuedRoleStatus(role, status) {
+  return status === 'ready' || ((role === 'worker' || role === 'validator') && status === 'paused')
+}
+
+function isIssueSubtask(subtask) {
+  const status = normalizeStageStateLabel(subtask?.status)
+  if (status === 'failed') return true
+  if (normalizeString(subtask?.error_message)) return true
+  return status === 'blocked' && hasMeaningfulBlock(subtask?.blocked_reason)
+}
+
+function isDependencyWaitingSubtask(subtask) {
+  const status = normalizeStageStateLabel(subtask?.status)
+  return status === 'blocked' && !isIssueSubtask(subtask)
+}
+
 function roleStatuses(subtask) {
   return ORCHESTRATION_ROLE_ORDER.map((role) => String(subtask?.[`${role}_status`] || '').toLowerCase()).filter(Boolean)
 }
@@ -448,6 +825,48 @@ function normalizeString(value) {
   return String(value || '').trim()
 }
 
+function normalizeTimestamp(value) {
+  return normalizeString(value)
+}
+
+function normalizeRunStatus(value) {
+  switch (normalizeString(value).toLowerCase()) {
+    case 'running':
+      return 'running'
+    case 'paused':
+      return 'paused'
+    case 'completed':
+      return 'completed'
+    case 'failed':
+      return 'failed'
+    default:
+      return ''
+  }
+}
+
+function normalizeFocusStatus(value, fallbackStatus) {
+  switch (normalizeString(value).toLowerCase()) {
+    case 'starting':
+      return 'starting'
+    case 'running':
+      return 'running'
+    case 'blocked':
+      return 'blocked'
+    case 'stalled':
+      return 'stalled'
+    case 'failed':
+      return 'failed'
+    case 'paused':
+      return 'paused'
+    case 'completed':
+      return 'completed'
+    case 'waiting':
+      return 'waiting'
+    default:
+      return normalizeRunStatus(fallbackStatus) || 'not_started'
+  }
+}
+
 function normalizeRoleState(value) {
   switch (String(value || '').trim().toLowerCase()) {
     case 'starting':
@@ -479,6 +898,7 @@ function normalizeStageTone(status) {
       return 'warn'
     case 'completed':
       return 'success'
+    case 'waiting':
     default:
       return 'info'
   }
@@ -500,6 +920,8 @@ function normalizeStageStateLabel(status) {
       return 'failed'
     case 'stalled':
       return 'stalled'
+    case 'waiting':
+      return 'waiting'
     default:
       return 'not_started'
   }

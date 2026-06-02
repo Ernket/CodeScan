@@ -24,8 +24,7 @@ func useTestScannerConfig(t *testing.T) {
 	t.Helper()
 	config.Scanner, _ = config.NormalizeScannerConfig(config.ScannerConfig{
 		ContextCompression: config.ContextCompressionConfig{
-			SoftLimitBytes:         2048,
-			HardLimitBytes:         4096,
+			ContextWindowTokens:    13024,
 			SummaryWindowMessages:  8,
 			MicrocompactKeepRecent: 1,
 			CompactMinTailMessages: 2,
@@ -117,8 +116,15 @@ func new524Error() error {
 func requestUsesStream(t *testing.T, req *http.Request) bool {
 	t.Helper()
 
+	body := readRequestBody(t, req)
+	return strings.Contains(body, `"stream":true`) || strings.Contains(body, `"stream": true`)
+}
+
+func readRequestBody(t *testing.T, req *http.Request) string {
+	t.Helper()
+
 	if req == nil || req.Body == nil {
-		return false
+		return ""
 	}
 
 	body, err := io.ReadAll(req.Body)
@@ -126,9 +132,7 @@ func requestUsesStream(t *testing.T, req *http.Request) bool {
 		t.Fatalf("read request body: %v", err)
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
-
-	bodyText := string(body)
-	return strings.Contains(bodyText, `"stream":true`) || strings.Contains(bodyText, `"stream": true`)
+	return string(body)
 }
 
 func newChatCompletionResponse(t *testing.T, content string) *http.Response {
@@ -357,9 +361,83 @@ func TestActiveMessagesIncludePreservedSegmentAfterBoundary(t *testing.T) {
 	if len(active) != 3 {
 		t.Fatalf("expected preserved segment + summary, got %d messages", len(active))
 	}
-	if active[0].Content != "old-a" || active[1].Content != "old-b" || active[2].Content != "summary" {
+	if active[0].Content != "summary" || active[1].Content != "old-a" || active[2].Content != "old-b" {
 		t.Fatalf("unexpected active message sequence: %+v", active)
 	}
+}
+
+func TestReconcileActiveBoundaryFallsBackToLatestTranscriptBoundary(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	if err := session.appendSynthetic(openai.ChatMessageRoleAssistant, runtimeKindNormal, "old", nil); err != nil {
+		t.Fatalf("append old: %v", err)
+	}
+	if err := session.appendSynthetic(openai.ChatMessageRoleSystem, runtimeKindCompactBoundary, "", &compactBoundary{Source: "test"}); err != nil {
+		t.Fatalf("append boundary: %v", err)
+	}
+	boundaryID := session.transcript[len(session.transcript)-1].ID
+	if err := session.appendSynthetic(openai.ChatMessageRoleUser, runtimeKindCompactSummary, "summary", nil); err != nil {
+		t.Fatalf("append summary: %v", err)
+	}
+
+	session.state.ActiveBoundaryID = "missing-boundary"
+	if err := session.saveState(); err != nil {
+		t.Fatalf("save broken state: %v", err)
+	}
+
+	reloaded, err := loadScanSession(task, "auth", "prompt")
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	if reloaded.state.ActiveBoundaryID != boundaryID {
+		t.Fatalf("expected active boundary to recover to %q, got %q", boundaryID, reloaded.state.ActiveBoundaryID)
+	}
+	active := reloaded.activeMessages()
+	if len(active) != 1 || active[0].Content != "summary" {
+		t.Fatalf("expected old history to be pruned after recovered boundary, got %+v", active)
+	}
+}
+
+func TestAppendChatMessagePersistsReasoningContent(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	msg := openai.ChatCompletionMessage{
+		Role:             openai.ChatMessageRoleAssistant,
+		Content:          "final answer",
+		ReasoningContent: "private thinking trace",
+	}
+	if err := session.appendChatMessage(msg); err != nil {
+		t.Fatalf("append chat message: %v", err)
+	}
+	persistedID := session.transcript[len(session.transcript)-1].ID
+	if session.transcript[len(session.transcript)-1].ReasoningContent != msg.ReasoningContent {
+		t.Fatalf("expected transcript reasoning content to persist, got %+v", session.transcript[len(session.transcript)-1])
+	}
+
+	reloaded, err := loadScanSession(task, "auth", "prompt")
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	entries := reloaded.buildChatEntries()
+	for _, entry := range entries {
+		if entry.Message.ID == persistedID {
+			if entry.Chat.ReasoningContent != msg.ReasoningContent {
+				t.Fatalf("expected rebuilt chat message reasoning content %q, got %q", msg.ReasoningContent, entry.Chat.ReasoningContent)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected persisted message %s in rebuilt entries", persistedID)
 }
 
 func TestTruncateLastToolMessageStoresArtifact(t *testing.T) {
@@ -450,6 +528,126 @@ func TestApplyMicrocompactClearsOlderToolResultsOnly(t *testing.T) {
 	}
 }
 
+func TestMaybeApplyMicrocompactForPromptTokensSkipsBelowThreshold(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	oldToolID := appendMicrocompactToolRound(t, session, "call-1", "read_file", `{"path":"a.go"}`, "older result")
+	newToolID := appendMicrocompactToolRound(t, session, "call-2", "grep_files", `{"pattern":"TODO"}`, "new result")
+
+	entries, triggered, err := session.maybeApplyMicrocompactForPromptTokens(openai.Usage{PromptTokens: 99}, 100, nil)
+	if err != nil {
+		t.Fatalf("maybe apply microcompact: %v", err)
+	}
+	if triggered {
+		t.Fatal("expected microcompact trigger to stay inactive below token threshold")
+	}
+	if len(session.state.Microcompact.ClearedMessages) != 0 {
+		t.Fatalf("expected no microcompact records below token threshold, got %+v", session.state.Microcompact.ClearedMessages)
+	}
+	assertEntryContent(t, entries, oldToolID, "older result")
+	assertEntryContent(t, entries, newToolID, "new result")
+}
+
+func TestMaybeApplyMicrocompactForPromptTokensClearsAtThreshold(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	oldToolID := appendMicrocompactToolRound(t, session, "call-1", "read_file", `{"path":"a.go"}`, "older result")
+	newToolID := appendMicrocompactToolRound(t, session, "call-2", "grep_files", `{"pattern":"TODO"}`, "new result")
+
+	entries, triggered, err := session.maybeApplyMicrocompactForPromptTokens(openai.Usage{PromptTokens: 100}, 100, nil)
+	if err != nil {
+		t.Fatalf("maybe apply microcompact: %v", err)
+	}
+	if !triggered {
+		t.Fatal("expected microcompact trigger at token threshold")
+	}
+	if _, ok := session.state.Microcompact.ClearedMessages[oldToolID]; !ok {
+		t.Fatal("expected older tool result to be microcompacted at token threshold")
+	}
+	if _, ok := session.state.Microcompact.ClearedMessages[newToolID]; ok {
+		t.Fatal("expected latest tool round to remain intact at token threshold")
+	}
+	assertEntryContains(t, entries, oldToolID, "get_artifact")
+	assertEntryContent(t, entries, newToolID, "new result")
+}
+
+func TestMaybeApplyMicrocompactForPromptTokensSkipsWithoutUsage(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	oldToolID := appendMicrocompactToolRound(t, session, "call-1", "read_file", `{"path":"a.go"}`, "older result")
+	appendMicrocompactToolRound(t, session, "call-2", "grep_files", `{"pattern":"TODO"}`, "new result")
+
+	entries, triggered, err := session.maybeApplyMicrocompactForPromptTokens(openai.Usage{}, 100, nil)
+	if err != nil {
+		t.Fatalf("maybe apply microcompact: %v", err)
+	}
+	if triggered {
+		t.Fatal("expected microcompact trigger to stay inactive without API usage")
+	}
+	if len(session.state.Microcompact.ClearedMessages) != 0 {
+		t.Fatalf("expected no microcompact records without usage, got %+v", session.state.Microcompact.ClearedMessages)
+	}
+	assertEntryContent(t, entries, oldToolID, "older result")
+}
+
+func appendMicrocompactToolRound(t *testing.T, session *scanSession, callID, toolName, arguments, result string) string {
+	t.Helper()
+	round := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleAssistant,
+		ToolCalls: []openai.ToolCall{
+			{ID: callID, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: toolName, Arguments: arguments}},
+		},
+	}
+	if err := session.appendChatMessage(round); err != nil {
+		t.Fatalf("append assistant round %s: %v", callID, err)
+	}
+	if err := session.appendToolMessage(callID, toolName, result, ""); err != nil {
+		t.Fatalf("append tool result %s: %v", callID, err)
+	}
+	return session.transcript[len(session.transcript)-1].ID
+}
+
+func assertEntryContent(t *testing.T, entries []chatEntry, id, want string) {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Message.ID == id {
+			if entry.Chat.Content != want {
+				t.Fatalf("expected entry %s content %q, got %q", id, want, entry.Chat.Content)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected entry %s to be present", id)
+}
+
+func assertEntryContains(t *testing.T, entries []chatEntry, id, want string) {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Message.ID == id {
+			if !strings.Contains(entry.Chat.Content, want) {
+				t.Fatalf("expected entry %s to contain %q, got %q", id, want, entry.Chat.Content)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected entry %s to be present", id)
+}
+
 func TestTrySessionMemoryCompactionKeepsOnlyMessagesAfterMemoryCursor(t *testing.T) {
 	useTestScannerConfig(t)
 	task := newTestTask(t)
@@ -473,8 +671,9 @@ func TestTrySessionMemoryCompactionKeepsOnlyMessagesAfterMemoryCursor(t *testing
 		t.Fatalf("save state: %v", err)
 	}
 
+	root := session.buildChatEntries()[0]
 	entries := session.buildChatEntries()[1:]
-	summary, kept, ok := session.trySessionMemoryCompaction(entries)
+	summary, kept, ok := session.trySessionMemoryCompaction(entries, root, 10_000, 10_000)
 	if !ok {
 		t.Fatal("expected session memory compaction to activate")
 	}
@@ -483,6 +682,43 @@ func TestTrySessionMemoryCompactionKeepsOnlyMessagesAfterMemoryCursor(t *testing
 	}
 	if len(kept) != 1 || kept[0].Chat.Content != "after-memory" {
 		t.Fatalf("expected only post-memory messages to remain, got %+v", kept)
+	}
+}
+
+func TestTrySessionMemoryCompactionSkipsWhenTailExceedsLimit(t *testing.T) {
+	useTestScannerConfig(t)
+	task := newTestTask(t)
+	session, err := newScanSession(task, "auth", "prompt", true)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	if err := session.appendSynthetic(openai.ChatMessageRoleAssistant, runtimeKindNormal, "before-memory", nil); err != nil {
+		t.Fatalf("append before-memory: %v", err)
+	}
+	beforeMemoryID := session.transcript[len(session.transcript)-1].ID
+	if err := session.appendSynthetic(openai.ChatMessageRoleUser, runtimeKindNormal, strings.Repeat("x", 500), nil); err != nil {
+		t.Fatalf("append large tail: %v", err)
+	}
+	if err := session.writeMemory("# Memory\nKnown context"); err != nil {
+		t.Fatalf("write memory: %v", err)
+	}
+	session.state.LastMemoryMessageID = beforeMemoryID
+	if err := session.saveState(); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	chatEntries := session.buildChatEntries()
+	_, _, ok := session.trySessionMemoryCompaction(chatEntries[1:], chatEntries[0], 0, 100)
+	if ok {
+		t.Fatal("expected session memory compaction to skip oversized tail")
+	}
+}
+
+func TestFormatCompactSummaryKeepsOnlySummaryTag(t *testing.T) {
+	got := formatCompactSummary("<analysis>scratch</analysis>\n<summary>\nDurable handoff\n</summary>")
+	if got != "Durable handoff" {
+		t.Fatalf("expected summary content only, got %q", got)
 	}
 }
 

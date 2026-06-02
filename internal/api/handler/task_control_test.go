@@ -270,6 +270,7 @@ func setTaskControlTestDeps(t *testing.T, deps taskControlTestDeps) func() {
 func performTaskControlRequest(method, path, taskID string, handler gin.HandlerFunc) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
+	setTestCurrentUser(c)
 	c.Request = httptest.NewRequest(method, path, nil)
 	c.Params = gin.Params{{Key: "id", Value: taskID}}
 	handler(c)

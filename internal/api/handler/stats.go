@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -9,7 +10,10 @@ import (
 )
 
 func GetStatsHandler(c *gin.Context) {
-	list, err := loadTasksForSummary()
+	list, err := loadTasksForSummary(c)
+	if errors.Is(err, errResponseWritten) {
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load dashboard stats"})
 		return

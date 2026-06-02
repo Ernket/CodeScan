@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,7 +14,7 @@ import (
 )
 
 func main() {
-	// Note: Initialization of directories and auth key is now handled by cmd/init/main.go
+	// Note: Initialization of directories and token signing key is handled by cmd/init/main.go.
 
 	// Define config flag
 	configFile := flag.String("config", "data/config.json", "Path to configuration file")
@@ -35,39 +34,13 @@ func main() {
 	}
 
 	// Override with Environment Variables
-	if v := os.Getenv("CODESCAN_AUTH_KEY"); v != "" {
-		cfg.AuthKey = v
-	}
-	if v := os.Getenv("CODESCAN_DB_HOST"); v != "" {
-		cfg.DBConfig.Host = v
-	}
-	if v := os.Getenv("CODESCAN_DB_PORT"); v != "" {
-		if port, err := strconv.Atoi(v); err == nil {
-			cfg.DBConfig.Port = port
-		}
-	}
-	if v := os.Getenv("CODESCAN_DB_USER"); v != "" {
-		cfg.DBConfig.User = v
-	}
-	if v := os.Getenv("CODESCAN_DB_PASSWORD"); v != "" {
-		cfg.DBConfig.Password = v
-	}
-	if v := os.Getenv("CODESCAN_DB_NAME"); v != "" {
-		cfg.DBConfig.DBName = v
-	}
-	if v := os.Getenv("CODESCAN_AI_API_KEY"); v != "" {
-		cfg.AIConfig.APIKey = v
-	}
-	if v := os.Getenv("CODESCAN_AI_BASE_URL"); v != "" {
-		cfg.AIConfig.BaseURL = v
-	}
-	if v := os.Getenv("CODESCAN_AI_MODEL"); v != "" {
-		cfg.AIConfig.Model = v
-	}
+	cfg = config.ApplyEnvOverrides(cfg)
 
 	// Set defaults for AI config
-	if cfg.AIConfig.Model == "" {
-		cfg.AIConfig.Model = "gemini-3-pro-high"
+	var aiWarnings []string
+	cfg.AIConfig, aiWarnings = config.NormalizeAIConfig(cfg.AIConfig)
+	for _, warning := range aiWarnings {
+		fmt.Printf("Warning: %s\n", warning)
 	}
 	var scannerWarnings []string
 	cfg.ScannerConfig, scannerWarnings = config.NormalizeScannerConfig(cfg.ScannerConfig)
@@ -82,7 +55,7 @@ func main() {
 	config.Orchestration = cfg.OrchestrationConfig
 
 	if cfg.AuthKey == "" {
-		fmt.Println("Error: Auth Key not found. Please run 'go run cmd/init/main.go' first.")
+		fmt.Println("Error: token signing key not found. Please run 'go run cmd/init/main.go' first.")
 		return
 	}
 
@@ -96,7 +69,7 @@ func main() {
 	}
 
 	fmt.Println("==================================================")
-	fmt.Printf("Loaded AUTH KEY: %s\n", cfg.AuthKey)
+	fmt.Println("Loaded token signing key")
 	fmt.Println("Connected to Database")
 	fmt.Println("==================================================")
 
@@ -104,7 +77,7 @@ func main() {
 	r := gin.Default()
 
 	// Init Router
-	router.InitRouter(r, cfg.AuthKey)
+	router.InitRouterWithFrontend(r, cfg.AuthKey, frontendFS())
 
 	r.Run(":8089")
 }

@@ -4,13 +4,16 @@ import axios from 'axios'
 import {
   Lock, Upload, Trash2, Play, Pause, RefreshCw, Server, Shield, ShieldAlert,
   FileCode, XCircle, Terminal, Activity, Zap,
-  LayoutDashboard, FolderOpen, LogOut, ChevronRight, Download
+  LayoutDashboard, FolderOpen, LogOut, ChevronRight, Download, UserCog, User, KeyRound, Building2
 } from 'lucide-vue-next'
 import DashboardOverview from './components/DashboardOverview.vue'
 import TaskStageStrip from './components/TaskStageStrip.vue'
 import AuditStageView from './components/AuditStageView.vue'
 import TaskOrchestrationWorkbench from './components/TaskOrchestrationWorkbench.vue'
+import AccountManagement from './components/AccountManagement.vue'
+import OrganizationManagement from './components/OrganizationManagement.vue'
 import { DEFAULT_LOCALE, LOCALE_STORAGE_KEY, getIntlLocale, getMessage } from './i18n'
+import { buildTaskOrchestrationPreview, pickDefaultRerunStages } from './utils/orchestration'
 import {
   buildSeverityBreakdown,
   countRouteInventory,
@@ -49,29 +52,38 @@ const getStoredLocale = () => {
 
 const isAuthenticated = ref(false)
 const authKey = ref('')
+const loginForm = ref({ username: '', password: '' })
+const currentUser = ref(null)
 const locale = ref(getStoredLocale())
 const currentView = ref('dashboard')
 const selectedTask = ref(null)
 const selectedTaskId = ref('')
 const tasks = ref([])
 const stats = ref(createEmptyStats())
+const accessibleOrganizations = ref([])
 const showUploadModal = ref(false)
-const uploadForm = ref({ name: '', remark: '', file: null })
+const rerunModalOpen = ref(false)
+const uploadForm = ref({ name: '', remark: '', file: null, organization_id: '' })
 const isUploading = ref(false)
 const isRepairing = ref(false)
 const isLoading = ref(false)
 const isTaskLoading = ref(false)
 const isDownloadingReport = ref(false)
+const isStartFlowPending = ref(false)
 const stageActionPending = ref({})
 const sidebarOpen = ref(true)
 const consoleContainer = ref(null)
-const activeTab = ref('console')
+const activeTab = ref('results')
+const rerunSelection = ref([])
+const rerunModalError = ref('')
 
 const displayStats = ref({ projects: 0, interfaces: 0, vulns: 0, completed_audits: 0 })
 
 const t = (key, params = {}) => getMessage(locale.value, key, params)
 const formatDateTime = (value) => new Date(value).toLocaleString(getIntlLocale(locale.value))
 const displayStatus = (status) => t(`status.${String(status || '').trim().toLowerCase() || 'pending'}`)
+const stageErrorPattern = /error|failed|\u5931\u8d25|\u5f02\u5e38/i
+const stageErrorLogLookback = 20
 
 const stageBaseDefinitions = [
   {
@@ -163,8 +175,15 @@ const stageDisplayName = (stageName) => {
 
 const currentTaskName = computed(() => {
   if (currentView.value === 'dashboard') return t('app.overview')
+  if (currentView.value === 'accounts') return t('app.accounts')
+  if (currentView.value === 'organizations') return t('organizations.title')
   return selectedTask.value?.name || tasks.value.find(task => task.id === selectedTaskId.value)?.name || t('app.loadingTask')
 })
+const taskPrimaryTabs = computed(() => [
+  { key: 'task-detail', label: t('taskDetail.tabs.overview') },
+  { key: 'task-orchestration', label: t('taskDetail.tabs.orchestration') },
+  { key: 'task-report', label: t('taskDetail.tabs.report'), badge: reportStages.value.length },
+])
 
 const severityBadgeClass = (severity) => {
   switch (normalizeSeverity(severity)) {
@@ -185,7 +204,80 @@ const severityBadgeClass = (severity) => {
   }
 }
 
+const statusBadgeClass = (status) => {
+  switch (String(status || '').trim().toLowerCase()) {
+    case 'running':
+      return 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
+    case 'completed':
+      return 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+    case 'failed':
+      return 'bg-rose-500/10 text-rose-300 border border-rose-500/30'
+    case 'paused':
+      return 'bg-sky-500/10 text-sky-300 border border-sky-500/30'
+    default:
+      return 'bg-slate-500/10 text-slate-300 border border-slate-500/30'
+  }
+}
+
 const getStageRecord = (task, stageName) => task?.stages?.find(stage => stage.name === stageName) || null
+
+const normalizeLogText = (log) => {
+  if (typeof log === 'string') return log
+  if (log === null || log === undefined) return ''
+  try {
+    return JSON.stringify(log)
+  } catch {
+    return String(log)
+  }
+}
+
+const stripLogTimestamp = (text) => String(text || '').replace(/^\[[^\]]+\]\s*/, '').trim()
+const compactStageMessage = (text, maxLength = 180) => {
+  const compacted = stripLogTimestamp(text).replace(/\s+/g, ' ')
+  if (compacted.length <= maxLength) return compacted
+  return `${compacted.slice(0, maxLength - 3)}...`
+}
+
+const latestStageErrorLog = (logs = []) => {
+  if (!Array.isArray(logs) || logs.length === 0) return ''
+  const start = Math.max(0, logs.length - stageErrorLogLookback)
+
+  for (let index = logs.length - 1; index >= start; index--) {
+    const text = normalizeLogText(logs[index])
+    if (stageErrorPattern.test(text)) {
+      return compactStageMessage(text)
+    }
+  }
+
+  return ''
+}
+
+const stageErrorSummaries = computed(() => {
+  if (!selectedTask.value) return []
+
+  return stageDefinitions.value
+    .map(definition => {
+      const stage = getStageRecord(selectedTask.value, definition.key)
+      if (!stage) return null
+
+      const status = String(stage.status || '').trim().toLowerCase()
+      const errorLog = latestStageErrorLog(stage.logs)
+      if (status !== 'failed' && !errorLog) return null
+
+      const resultSummary = compactStageMessage(stage.result || '')
+
+      return {
+        key: definition.key,
+        view: definition.view,
+        label: definition.label,
+        status,
+        statusLabel: displayStatus(status),
+        message: errorLog || resultSummary || t('taskStrip.lastRunFailed'),
+        updatedAt: stage.updated_at ? formatDateTime(stage.updated_at) : '',
+      }
+    })
+    .filter(Boolean)
+})
 
 const currentAuditStage = computed(() => {
   if (!selectedTask.value) return null
@@ -207,8 +299,18 @@ const parsedResult = computed(() => {
   let raw = null
   if (auditViews.value[currentView.value]) {
     if (!currentAuditStage.value) return null
+    if (currentAuditStage.value.status === 'failed') {
+      const outputItems = parseResultArray(currentAuditStage.value.output_json)
+      if (Array.isArray(outputItems) && outputItems.length > 0) return outputItems
+      return parseResultArray(currentAuditStage.value.result)
+    }
     raw = currentAuditStage.value.output_json || currentAuditStage.value.result
   } else {
+    if (selectedTask.value?.status === 'failed') {
+      const outputItems = parseResultArray(selectedTask.value?.output_json)
+      if (Array.isArray(outputItems) && outputItems.length > 0) return outputItems
+      return parseResultArray(selectedTask.value?.result)
+    }
     raw = selectedTask.value?.output_json || selectedTask.value?.result
   }
   return parseResultArray(raw)
@@ -222,7 +324,43 @@ const currentRawResult = computed(() => {
   return selectedTask.value?.result || ''
 })
 
+const flattenOrganizationTree = (nodes = [], depth = 0) => nodes.flatMap((node) => {
+  const treeDepth = Number.isInteger(node.depth) ? node.depth : depth
+  const current = {
+    ...node,
+    treeDepth,
+    displayName: `${'  '.repeat(treeDepth)}${node.name}`,
+  }
+  return [current, ...flattenOrganizationTree(node.children || [], treeDepth + 1)]
+})
+
 const currentAuditDefinition = computed(() => stageDefinitions.value.find(stage => stage.view === currentView.value) || null)
+const normalizeTaskStatus = (task) => String(task?.status || '').trim().toLowerCase()
+const currentUserRole = computed(() => currentUser.value?.role || 'observer')
+const canDelete = computed(() => currentUserRole.value === 'super_admin')
+const canManageUsers = computed(() => currentUserRole.value === 'super_admin')
+const flatOrganizations = computed(() => flattenOrganizationTree(accessibleOrganizations.value))
+const writableOrganizations = computed(() => flatOrganizations.value.filter((organization) => organization.effective_role === 'admin'))
+const canCreateProject = computed(() => writableOrganizations.value.length > 0)
+const canWriteTask = (task) => canDelete.value || task?.permissions?.can_write === true
+const selectedTaskCanWrite = computed(() => canWriteTask(selectedTask.value))
+const taskOrganizationName = (task) => task?.organization?.name || t('common.unassigned')
+const canRequestTaskStart = (task = selectedTask.value) => canWriteTask(task) && ['pending', 'failed', 'completed'].includes(normalizeTaskStatus(task))
+const taskStartActionLabel = (task = selectedTask.value) => (
+  normalizeTaskStatus(task) === 'pending'
+    ? t('taskDetail.startScan')
+    : t('taskDetail.selectRerunStages')
+)
+const taskOrchestrationPreview = computed(() => {
+  const preview = buildTaskOrchestrationPreview(selectedTask.value?.orchestration)
+  return {
+    ...preview,
+    focusStatusLabel: t(`orchestration.state.${preview.focusStatus}`),
+    currentStageLabel: preview.currentStage ? stageDisplayName(preview.currentStage) : t('taskDetail.orchestrationNoFocusedStage'),
+    lastProgressLabel: preview.lastProgressAt ? formatDateTime(preview.lastProgressAt) : t('taskDetail.orchestrationNoRecentProgress'),
+    latestEventAtLabel: preview.latestEventAt ? formatDateTime(preview.latestEventAt) : '',
+  }
+})
 
 const summarizeStageForReport = (task, definition) => {
   const stage = getStageRecord(task, definition.key)
@@ -314,8 +452,54 @@ const reportOverview = computed(() => {
 
 const stageActionKey = (stageName, action) => `${stageName}:${action}`
 const isStageActionPending = (stageName, action) => Boolean(stageActionPending.value[stageActionKey(stageName, action)])
+const rerunStageOptions = computed(() => {
+  const task = selectedTask.value
+  if (!task) return []
 
-const authConfig = () => ({ headers: { Authorization: authKey.value } })
+  const hasRoutes = countRouteInventory(task) > 0
+  const initStatus = hasRoutes ? 'completed' : (String(task.status || '').trim().toLowerCase() === 'failed' ? 'failed' : 'pending')
+  const initUpdatedAt = task.created_at ? formatDateTime(task.created_at) : ''
+  const options = [
+    {
+      key: 'init',
+      label: t('stage.init.label'),
+      detail: hasRoutes ? t('taskDetail.routesCount', { count: countRouteInventory(task) }) : t('taskDetail.waitingForExecution'),
+      status: initStatus,
+      updatedAt: initUpdatedAt,
+    },
+  ]
+
+  for (const definition of stageDefinitions.value) {
+    const stage = getStageRecord(task, definition.key)
+    options.push({
+      key: definition.key,
+      label: definition.label,
+      detail: stage?.updated_at ? t('common.completedAt') : t('taskDetail.waitingForExecution'),
+      status: stage?.status || 'pending',
+      updatedAt: stage?.updated_at ? formatDateTime(stage.updated_at) : '',
+    })
+  }
+
+  return options
+})
+
+const authConfig = () => ({ headers: { Authorization: `Bearer ${authKey.value}` } })
+
+const organizationErrorKeys = {
+  'organization_id is required': 'organizationIdRequired',
+  'Failed to inspect organization permissions': 'failedInspectPermissions',
+  'Permission denied': 'permissionDenied',
+}
+
+const translateOrganizationError = (message, fallback = '') => {
+  const trimmed = String(message || '').trim()
+  const key = organizationErrorKeys[trimmed]
+  if (key) {
+    const translated = t(`organizations.${key}`)
+    if (translated !== `organizations.${key}`) return translated
+  }
+  return trimmed || fallback
+}
 
 const normalizeStatsResponse = (payload = {}) => ({
   ...createEmptyStats(),
@@ -336,30 +520,102 @@ const snapshotTaskSummary = (task) => task ? {
   output_json: task.output_json || null,
 } : null
 
+let detailAbortController = null
+let detailRequestSeq = 0
+let detailLoadingSeq = 0
+
+const cancelDetailRequest = () => {
+  if (detailAbortController) {
+    detailAbortController.abort()
+    detailAbortController = null
+  }
+}
+
+const isDetailCanceled = (error) => (
+  axios.isCancel?.(error) ||
+  error?.code === 'ERR_CANCELED' ||
+  error?.name === 'CanceledError' ||
+  error?.name === 'AbortError'
+)
+
 const goDashboard = () => {
+  closeRerunModal()
+  cancelDetailRequest()
   currentView.value = 'dashboard'
   selectedTask.value = null
   selectedTaskId.value = ''
 }
 
+const openAccounts = () => {
+  if (!canManageUsers.value) return
+  closeRerunModal()
+  cancelDetailRequest()
+  currentView.value = 'accounts'
+  selectedTask.value = null
+  selectedTaskId.value = ''
+}
+
+const openOrganizations = () => {
+  if (!canManageUsers.value) return
+  closeRerunModal()
+  cancelDetailRequest()
+  currentView.value = 'organizations'
+  selectedTask.value = null
+  selectedTaskId.value = ''
+}
+
+const handleOrganizationsUpdated = async () => {
+  await fetchData()
+}
+
+const findTaskById = (id) => {
+  if (selectedTask.value?.id === id) return selectedTask.value
+  return tasks.value.find((task) => task.id === id) || null
+}
+
+const canWriteTaskById = (id) => canWriteTask(findTaskById(id))
+
 const fetchTaskDetail = async (taskId = selectedTaskId.value, options = {}) => {
   if (!taskId || !isAuthenticated.value) return null
 
   const { silent = false, fallback = null } = options
+  const requestedTaskId = String(taskId)
+  const requestSeq = ++detailRequestSeq
+  const showLoading = !silent
 
-  if (fallback) {
+  cancelDetailRequest()
+
+  if (fallback && String(selectedTaskId.value) === requestedTaskId) {
     selectedTask.value = snapshotTaskSummary(fallback)
   }
-  if (!silent) {
+  if (showLoading) {
+    detailLoadingSeq = requestSeq
     isTaskLoading.value = true
   }
 
+  const controller = new AbortController()
+  detailAbortController = controller
+
+  const canCommit = () => (
+    requestSeq === detailRequestSeq &&
+    String(selectedTaskId.value) === requestedTaskId
+  )
+
   try {
-    const res = await axios.get(`${API_URL}/tasks/${taskId}`, authConfig())
+    const res = await axios.get(`${API_URL}/tasks/${requestedTaskId}`, {
+      ...authConfig(),
+      signal: controller.signal,
+    })
+
+    if (!canCommit()) return null
+    if (String(res.data?.id) !== requestedTaskId) return null
+
     selectedTask.value = res.data
-    selectedTaskId.value = res.data.id
     return res.data
   } catch (e) {
+    if (isDetailCanceled(e)) return null
+    if (!canCommit()) return null
+
     console.error(e)
     if (e.response?.status === 404) {
       goDashboard()
@@ -370,13 +626,17 @@ const fetchTaskDetail = async (taskId = selectedTaskId.value, options = {}) => {
     }
     return null
   } finally {
-    if (!silent) {
+    if (detailAbortController === controller) {
+      detailAbortController = null
+    }
+    if (showLoading && detailLoadingSeq === requestSeq) {
       isTaskLoading.value = false
     }
   }
 }
 
 const runStage = async (taskId, stageName, options = {}) => {
+  if (!canWriteTaskById(taskId)) return false
   const { skipConfirm = false, successMessage = t('alerts.stageStarted') } = options
   if (!skipConfirm && !confirm(t('confirm.startStage', { stage: stageDisplayName(stageName) }))) return false
 
@@ -395,6 +655,7 @@ const runStage = async (taskId, stageName, options = {}) => {
 }
 
 const startTaskPipeline = async (taskId, options = {}) => {
+  if (!canWriteTaskById(taskId)) return false
   const { successMessage = t('alerts.scanStarted') } = options
 
   try {
@@ -411,7 +672,84 @@ const startTaskPipeline = async (taskId, options = {}) => {
   }
 }
 
+const closeRerunModal = () => {
+  rerunModalOpen.value = false
+  rerunModalError.value = ''
+  rerunSelection.value = []
+}
+
+const openRerunModal = (task = selectedTask.value) => {
+  if (!task) return
+  rerunSelection.value = pickDefaultRerunStages(task)
+  rerunModalError.value = ''
+  rerunModalOpen.value = true
+}
+
+const requestTaskStart = async (task = selectedTask.value) => {
+  if (!canWriteTask(task)) return false
+  if (!task || isStartFlowPending.value) return false
+
+  const status = String(task.status || '').trim().toLowerCase()
+  if (status === 'pending') {
+    isStartFlowPending.value = true
+    try {
+      return await startTaskPipeline(task.id, { successMessage: t('alerts.scanStarted') })
+    } finally {
+      isStartFlowPending.value = false
+    }
+  }
+
+  if (status === 'failed' || status === 'completed') {
+    openRerunModal(task)
+    return false
+  }
+
+  return false
+}
+
+const submitRerunSelection = async () => {
+  const task = selectedTask.value
+  if (!canWriteTask(task)) return
+  if (!task || isStartFlowPending.value) return
+
+  if (!rerunSelection.value.length) {
+    rerunModalError.value = t('taskDetail.rerunSelectAtLeastOne')
+    return
+  }
+
+  isStartFlowPending.value = true
+  rerunModalError.value = ''
+
+  try {
+    await axios.post(`${API_URL}/tasks/${task.id}/orchestration/rerun`, {
+      selected_stages: rerunSelection.value,
+    }, authConfig())
+    activeTab.value = 'console'
+    closeRerunModal()
+    await fetchData()
+    alert(t('taskDetail.rerunQueued'))
+  } catch (e) {
+    const message = e.response?.data?.error || e.message
+    rerunModalError.value = message
+  } finally {
+    isStartFlowPending.value = false
+  }
+}
+
+const selectFailedRerunStages = () => {
+  rerunSelection.value = pickDefaultRerunStages(selectedTask.value)
+}
+
+const selectAllAuditRerunStages = () => {
+  rerunSelection.value = stageDefinitions.value.map((stage) => stage.key)
+}
+
+const clearRerunStages = () => {
+  rerunSelection.value = []
+}
+
 const runStagePostAction = async (taskId, stageName, actionPath, actionLabel, options = {}) => {
+  if (!canWriteTaskById(taskId)) return false
   const { confirmMessage = '', successMessage = '' } = options
   if (confirmMessage && !confirm(confirmMessage)) return false
   const key = stageActionKey(stageName, actionPath)
@@ -462,6 +800,7 @@ const revalidateStage = async (taskId, stageName) => runStagePostAction(
 )
 
 const canGapCheckStage = (task, stageName) => {
+  if (!canWriteTask(task)) return false
   if (!task || task.status === 'running') return false
   if (stageName === 'init') return Array.isArray(parseResultArray(task?.output_json || task?.result))
   const stage = getStageRecord(task, stageName)
@@ -469,6 +808,7 @@ const canGapCheckStage = (task, stageName) => {
 }
 
 const canRevalidateStage = (task, stageName) => {
+  if (!canWriteTask(task)) return false
   if (!task || task.status === 'running' || stageName === 'init') return false
   const stage = getStageRecord(task, stageName)
   const parsed = parseResultArray(stage?.output_json || stage?.result)
@@ -476,12 +816,14 @@ const canRevalidateStage = (task, stageName) => {
 }
 
 const repairJSON = async (taskId, stageName) => {
+  if (!canWriteTaskById(taskId)) return
   if (isRepairing.value) return
   isRepairing.value = true
   try {
-    await axios.post(`${API_URL}/tasks/${taskId}/repair?stage=${stageName}`, {}, authConfig())
+    const response = await axios.post(`${API_URL}/tasks/${taskId}/repair?stage=${stageName}`, {}, authConfig())
     await fetchData()
-    alert(t('alerts.jsonRepaired'))
+    const count = Number(response.data?.count ?? (Array.isArray(response.data?.output_json) ? response.data.output_json.length : 0))
+    alert(count > 0 ? t('alerts.jsonRepairedWithCount', { count }) : t('alerts.jsonRepairedEmpty'))
   } catch (e) {
     alert(t('alerts.repairFailed', { message: e.response?.data?.error || e.message }))
   } finally {
@@ -573,22 +915,35 @@ const animateValue = (key, target) => {
 
 const login = async () => {
   try {
-    const res = await axios.post(`${API_URL}/login`, { key: authKey.value })
+    const res = await axios.post(`${API_URL}/login`, {
+      username: loginForm.value.username,
+      password: loginForm.value.password,
+    })
     if (res.data.token) {
       localStorage.setItem('auth_token', res.data.token)
+      localStorage.setItem('current_user', JSON.stringify(res.data.user || null))
+      authKey.value = res.data.token
+      currentUser.value = res.data.user || null
+      loginForm.value.password = ''
       isAuthenticated.value = true
       await fetchData()
     }
-  } catch {
-    alert(t('alerts.authenticationFailed'))
+  } catch (e) {
+    alert(e.response?.data?.error || t('alerts.authenticationFailed'))
   }
 }
 
 const logout = () => {
+  cancelDetailRequest()
   isAuthenticated.value = false
   localStorage.removeItem('auth_token')
+  localStorage.removeItem('current_user')
   authKey.value = ''
+  currentUser.value = null
+  loginForm.value.password = ''
   tasks.value = []
+  accessibleOrganizations.value = []
+  uploadForm.value = { name: '', remark: '', file: null, organization_id: '' }
   stats.value = createEmptyStats()
   displayStats.value = { projects: 0, interfaces: 0, vulns: 0, completed_audits: 0 }
   goDashboard()
@@ -599,6 +954,11 @@ const checkAuth = () => {
   const token = localStorage.getItem('auth_token')
   if (token) {
     authKey.value = token
+    try {
+      currentUser.value = JSON.parse(localStorage.getItem('current_user') || 'null')
+    } catch {
+      currentUser.value = null
+    }
     isAuthenticated.value = true
     fetchData()
   }
@@ -609,13 +969,15 @@ const fetchData = async () => {
 
   isLoading.value = true
   try {
-    const [statsRes, tasksRes] = await Promise.all([
+    const [statsRes, tasksRes, organizationsRes] = await Promise.all([
       axios.get(`${API_URL}/stats`, authConfig()),
-      axios.get(`${API_URL}/tasks`, authConfig())
+      axios.get(`${API_URL}/tasks`, authConfig()),
+      axios.get(`${API_URL}/organizations/accessible`, authConfig())
     ])
 
     stats.value = normalizeStatsResponse(statsRes.data)
     tasks.value = Array.isArray(tasksRes.data) ? tasksRes.data : []
+    accessibleOrganizations.value = Array.isArray(organizationsRes.data) ? organizationsRes.data : []
 
     if (selectedTaskId.value) {
       const summary = tasks.value.find(task => task.id === selectedTaskId.value)
@@ -640,32 +1002,39 @@ const handleFileUpload = (event) => {
   uploadForm.value.file = event.target.files[0]
 }
 
+const openUploadModal = () => {
+  if (!canCreateProject.value) return
+  if (!uploadForm.value.organization_id && writableOrganizations.value.length > 0) {
+    uploadForm.value.organization_id = String(writableOrganizations.value[0].id)
+  }
+  showUploadModal.value = true
+}
+
 const createTask = async () => {
+  if (!canCreateProject.value) return
+  if (!uploadForm.value.organization_id) return alert(t('organizations.selectRequired'))
   if (!uploadForm.value.file) return alert(t('alerts.pleaseSelectFile'))
 
   const formData = new FormData()
   formData.append('name', uploadForm.value.name)
   formData.append('remark', uploadForm.value.remark)
+  formData.append('organization_id', uploadForm.value.organization_id)
   formData.append('file', uploadForm.value.file)
 
   isUploading.value = true
   try {
-    const res = await axios.post(`${API_URL}/tasks`, formData, {
+    await axios.post(`${API_URL}/tasks`, formData, {
       headers: {
-        Authorization: authKey.value,
+        Authorization: `Bearer ${authKey.value}`,
         'Content-Type': 'multipart/form-data'
       }
     })
     showUploadModal.value = false
-    uploadForm.value = { name: '', remark: '', file: null }
+    uploadForm.value = { name: '', remark: '', file: null, organization_id: '' }
     await fetchData()
-    if (res.data?.status === 'failed') {
-      alert(t('alerts.autoStartFailed', { message: res.data?.result || 'unknown error' }))
-    } else {
-      alert(t('alerts.scanStarted'))
-    }
+    alert(t('alerts.projectCreated'))
   } catch (e) {
-    alert(t('alerts.uploadFailed', { message: e.response?.data?.error || e.message }))
+    alert(t('alerts.uploadFailed', { message: translateOrganizationError(e.response?.data?.error, e.message) }))
   } finally {
     isUploading.value = false
   }
@@ -677,6 +1046,7 @@ const getTaskForDelete = (id) => {
 }
 
 const deleteTask = async (id) => {
+  if (!canDelete.value) return
   const task = getTaskForDelete(id)
   if (task?.status === 'running') {
     alert(t('alerts.pauseTaskBeforeDelete'))
@@ -699,8 +1069,10 @@ const deleteTask = async (id) => {
 }
 
 const taskAction = async (id, action) => {
+  const task = findTaskById(id)
+  if (!canWriteTask(task)) return
   if (action === 'start') {
-    await startTaskPipeline(id, { successMessage: t('alerts.scanStarted') })
+    await requestTaskStart(task)
     return
   }
 
@@ -713,11 +1085,17 @@ const taskAction = async (id, action) => {
 }
 
 const openTask = async (task) => {
+  closeRerunModal()
   selectedTaskId.value = task.id
   selectedTask.value = snapshotTaskSummary(task)
   currentView.value = 'task-detail'
-  activeTab.value = 'console'
+  activeTab.value = 'results'
   await fetchTaskDetail(task.id, { fallback: task })
+}
+
+const openStageConsole = (view) => {
+  currentView.value = view
+  activeTab.value = 'console'
 }
 
 let pollTimer = null
@@ -741,6 +1119,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  cancelDetailRequest()
   stopPolling()
 })
 </script>
@@ -785,13 +1164,28 @@ onBeforeUnmount(() => {
 
               <form @submit.prevent="login" class="space-y-6">
                 <div class="space-y-2">
-                  <label class="text-xs uppercase tracking-wider text-slate-500 font-semibold ml-1">{{ t('login.securityKey') }}</label>
+                  <label class="text-xs uppercase tracking-wider text-slate-500 font-semibold ml-1">{{ t('login.username') }}</label>
                   <div class="relative group">
-                    <Lock class="absolute left-4 top-3.5 w-5 h-5 text-slate-600 group-focus-within:text-cyber-primary transition-colors duration-300" />
+                    <User class="absolute left-4 top-3.5 w-5 h-5 text-slate-600 group-focus-within:text-cyber-primary transition-colors duration-300" />
                     <input
-                      v-model="authKey"
+                      v-model="loginForm.username"
+                      type="text"
+                      autocomplete="username"
+                      :placeholder="t('login.usernamePlaceholder')"
+                      class="w-full pl-12 pr-4 py-3 bg-black/40 border border-white/10 rounded-xl focus:border-cyber-primary/50 focus:ring-1 focus:ring-cyber-primary/50 outline-none transition-all duration-300 text-white placeholder-slate-600 font-mono text-sm"
+                    >
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <label class="text-xs uppercase tracking-wider text-slate-500 font-semibold ml-1">{{ t('login.password') }}</label>
+                  <div class="relative group">
+                    <KeyRound class="absolute left-4 top-3.5 w-5 h-5 text-slate-600 group-focus-within:text-cyber-primary transition-colors duration-300" />
+                    <input
+                      v-model="loginForm.password"
                       type="password"
-                      :placeholder="t('login.placeholder')"
+                      autocomplete="current-password"
+                      :placeholder="t('login.passwordPlaceholder')"
                       class="w-full pl-12 pr-4 py-3 bg-black/40 border border-white/10 rounded-xl focus:border-cyber-primary/50 focus:ring-1 focus:ring-cyber-primary/50 outline-none transition-all duration-300 text-white placeholder-slate-600 font-mono text-sm"
                     >
                   </div>
@@ -847,6 +1241,26 @@ onBeforeUnmount(() => {
               <div v-if="currentView === 'dashboard' && sidebarOpen" class="ml-auto w-1.5 h-1.5 bg-cyber-primary rounded-full animate-pulse"></div>
             </button>
 
+            <button
+              v-if="canManageUsers"
+              @click="openAccounts()"
+              :class="['w-full flex items-center gap-4 px-4 py-3 rounded-xl transition-all duration-300 group', currentView === 'accounts' ? 'bg-cyber-primary/10 text-cyber-primary border border-cyber-primary/20 shadow-[0_0_15px_rgba(0,243,255,0.1)]' : 'hover:bg-white/5 text-slate-400 hover:text-white']"
+            >
+              <UserCog class="w-5 h-5 shrink-0" />
+              <span v-if="sidebarOpen" class="font-medium animate-fade-in">{{ t('app.accounts') }}</span>
+              <div v-if="currentView === 'accounts' && sidebarOpen" class="ml-auto w-1.5 h-1.5 bg-cyber-primary rounded-full animate-pulse"></div>
+            </button>
+
+            <button
+              v-if="canManageUsers"
+              @click="openOrganizations()"
+              :class="['w-full flex items-center gap-4 px-4 py-3 rounded-xl transition-all duration-300 group', currentView === 'organizations' ? 'bg-cyber-primary/10 text-cyber-primary border border-cyber-primary/20 shadow-[0_0_15px_rgba(0,243,255,0.1)]' : 'hover:bg-white/5 text-slate-400 hover:text-white']"
+            >
+              <Building2 class="w-5 h-5 shrink-0" />
+              <span v-if="sidebarOpen" class="font-medium animate-fade-in">{{ t('organizations.title') }}</span>
+              <div v-if="currentView === 'organizations' && sidebarOpen" class="ml-auto w-1.5 h-1.5 bg-cyber-primary rounded-full animate-pulse"></div>
+            </button>
+
             <div class="pt-6 pb-2" v-if="sidebarOpen">
               <p class="px-4 text-xs font-bold text-slate-500 uppercase tracking-widest animate-fade-in">{{ t('app.projects') }}</p>
             </div>
@@ -895,7 +1309,8 @@ onBeforeUnmount(() => {
                 {{ t('app.languageToggle') }}
               </button>
               <button
-                @click="showUploadModal = true"
+                v-if="canCreateProject"
+                @click="openUploadModal"
                 class="flex items-center gap-2 px-6 py-2.5 bg-cyber-primary/10 hover:bg-cyber-primary/20 text-cyber-primary border border-cyber-primary/50 rounded-lg font-semibold shadow-[0_0_15px_rgba(0,243,255,0.1)] hover:shadow-[0_0_25px_rgba(0,243,255,0.2)] transition-all transform hover:-translate-y-0.5"
               >
                 <Upload class="w-5 h-5" />
@@ -918,9 +1333,28 @@ onBeforeUnmount(() => {
               :selected-task-id="selectedTaskId"
               :locale="locale"
               :t="t"
+              :can-delete="canDelete"
               @refresh="fetchData"
               @open-task="openTask"
               @delete-task="deleteTask"
+            />
+
+            <AccountManagement
+              v-if="currentView === 'accounts' && canManageUsers"
+              :api-url="API_URL"
+              :auth-token="authKey"
+              :t="t"
+              :organizations="flatOrganizations"
+              @auth-expired="logout"
+            />
+
+            <OrganizationManagement
+              v-if="currentView === 'organizations' && canManageUsers"
+              :api-url="API_URL"
+              :auth-token="authKey"
+              :t="t"
+              @auth-expired="logout"
+              @updated="handleOrganizationsUpdated"
             />
 
             <!-- Task Detail View -->
@@ -937,86 +1371,55 @@ onBeforeUnmount(() => {
                   </div>
                   <h1 class="text-3xl font-bold text-white">{{ selectedTask.name }}</h1>
                   <p class="text-slate-400 mt-1">{{ selectedTask.remark }}</p>
+                  <div class="mt-3 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
+                    <Building2 class="w-3.5 h-3.5 text-cyan-300" />
+                    {{ taskOrganizationName(selectedTask) }}
+                  </div>
+                  <div class="mt-5 flex flex-wrap gap-2">
+                    <button
+                      v-for="tab in taskPrimaryTabs"
+                      :key="tab.key"
+                      @click="currentView = tab.key"
+                      :class="[
+                        'px-4 py-2 rounded-xl border text-sm font-semibold transition-colors flex items-center gap-2',
+                        currentView === tab.key
+                          ? 'bg-cyber-primary/12 text-cyber-primary border-cyber-primary/30'
+                          : 'bg-white/5 text-slate-300 border-white/10 hover:bg-white/10 hover:text-white'
+                      ]"
+                    >
+                      <span>{{ tab.label }}</span>
+                      <span v-if="tab.badge !== undefined" class="px-2 py-0.5 rounded-full bg-black/20 text-xs text-slate-300 border border-white/10">
+                        {{ tab.badge }}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
                 <div class="flex flex-wrap gap-3">
                   <button
-                    @click="currentView = 'task-rce'"
-                    class="px-5 py-2.5 bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <ShieldAlert class="w-4 h-4" /> {{ stageLabelByKey.rce }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-injection'"
-                    class="px-5 py-2.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <ShieldAlert class="w-4 h-4" /> {{ stageLabelByKey.injection }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-auth'"
-                    class="px-5 py-2.5 bg-sky-500/10 text-sky-400 border border-sky-500/30 hover:bg-sky-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <Lock class="w-4 h-4" /> {{ stageLabelByKey.auth }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-access'"
-                    class="px-5 py-2.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <Shield class="w-4 h-4" /> {{ stageLabelByKey.access }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-xss'"
-                    class="px-5 py-2.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <ShieldAlert class="w-4 h-4" /> {{ stageLabelByKey.xss }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-config'"
-                    class="px-5 py-2.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <FileCode class="w-4 h-4" /> {{ stageLabelByKey.config }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-fileop'"
-                    class="px-5 py-2.5 bg-orange-500/10 text-orange-400 border border-orange-500/30 hover:bg-orange-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <FolderOpen class="w-4 h-4" /> {{ stageLabelByKey.fileop }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-logic'"
-                    class="px-5 py-2.5 bg-rose-500/10 text-rose-400 border border-rose-500/30 hover:bg-rose-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <Zap class="w-4 h-4" /> {{ stageLabelByKey.logic }}
-                  </button>
-                  <button
-                    @click="currentView = 'task-report'"
-                    class="px-5 py-2.5 bg-white/5 text-slate-100 border border-white/10 hover:bg-white/10 rounded-lg font-bold flex items-center gap-2 transition-all"
-                  >
-                    <Download class="w-4 h-4" /> {{ t('taskDetail.reportExport') }}
-                    <span class="px-2 py-0.5 rounded-full bg-white/10 text-xs text-slate-300">{{ reportStages.length }}</span>
-                  </button>
-                  <button
-                    v-if="selectedTask.status === 'pending' || selectedTask.status === 'failed' || selectedTask.status === 'completed'"
+                    v-if="canRequestTaskStart(selectedTask)"
                     @click="taskAction(selectedTask.id, 'start')"
                     class="glass-button px-5 py-2.5 rounded-lg flex items-center gap-2"
                   >
-                    <Play class="w-4 h-4" /> {{ t('taskDetail.startScan') }}
+                    <Play class="w-4 h-4" />
+                    {{ taskStartActionLabel(selectedTask) }}
                   </button>
                   <button
-                    v-if="selectedTask.status === 'running'"
+                    v-if="selectedTaskCanWrite && selectedTask.status === 'running'"
                     @click="taskAction(selectedTask.id, 'pause')"
                     class="px-5 py-2.5 bg-yellow-500/20 text-yellow-400 border border-yellow-500/50 hover:bg-yellow-500/30 rounded-lg font-bold flex items-center gap-2 transition-all"
                   >
                     <Pause class="w-4 h-4" /> {{ t('common.pause') }}
                   </button>
                   <button
-                    v-if="selectedTask.status === 'paused'"
+                    v-if="selectedTaskCanWrite && selectedTask.status === 'paused'"
                     @click="taskAction(selectedTask.id, 'resume')"
                     class="glass-button px-5 py-2.5 rounded-lg flex items-center gap-2"
                   >
                     <Play class="w-4 h-4" /> {{ t('common.resume') }}
                   </button>
                   <button
+                    v-if="canDelete"
                     @click="deleteTask(selectedTask.id)"
                     class="px-5 py-2.5 bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
                   >
@@ -1025,24 +1428,68 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <TaskOrchestrationWorkbench
-                :task-id="selectedTask.id"
-                :task="selectedTask"
-                :api-url="API_URL"
-                :auth-token="authKey"
-                :locale="locale"
-                :t="t"
-                @refresh-task="fetchTaskDetail(selectedTask.id, { silent: true })"
-              />
-
               <TaskStageStrip
                 :task="selectedTask"
                 :stage-definitions="stageDefinitions"
                 :current-view="currentView"
-                :locale="locale"
                 :t="t"
                 @select-stage="currentView = $event"
               />
+
+              <div class="glass-panel rounded-2xl p-6 border border-white/10">
+                <div class="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-5">
+                  <div>
+                    <div class="text-xs uppercase tracking-[0.2em] text-slate-500">{{ t('taskDetail.orchestrationOverview') }}</div>
+                    <h2 class="text-2xl font-bold text-white mt-2">{{ t('taskDetail.tabs.orchestration') }}</h2>
+                    <p class="text-slate-400 mt-2 max-w-3xl">
+                      {{ taskOrchestrationPreview.hasRun ? t('taskDetail.orchestrationOverviewDesc') : t('taskDetail.orchestrationNoRunDesc') }}
+                    </p>
+                  </div>
+                  <div class="flex flex-wrap gap-3">
+                    <button
+                      @click="currentView = 'task-orchestration'"
+                      class="px-5 py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-100 font-semibold transition-colors"
+                    >
+                      {{ t('taskDetail.openWorkbench') }}
+                    </button>
+                    <button
+                      v-if="!taskOrchestrationPreview.hasRun && canRequestTaskStart(selectedTask)"
+                      @click="taskAction(selectedTask.id, 'start')"
+                      class="glass-button px-5 py-2.5 rounded-xl flex items-center gap-2"
+                    >
+                      <Play class="w-4 h-4" />
+                      {{ taskStartActionLabel(selectedTask) }}
+                    </button>
+                  </div>
+                </div>
+
+                <div v-if="taskOrchestrationPreview.hasRun" class="grid md:grid-cols-2 xl:grid-cols-4 gap-4 mt-6">
+                  <div class="rounded-2xl bg-white/5 border border-white/10 px-4 py-4">
+                    <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('taskDetail.orchestrationStatus') }}</div>
+                    <div class="mt-2 text-lg font-semibold text-white">{{ taskOrchestrationPreview.focusStatusLabel }}</div>
+                  </div>
+                  <div class="rounded-2xl bg-white/5 border border-white/10 px-4 py-4">
+                    <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('taskDetail.orchestrationCurrentStage') }}</div>
+                    <div class="mt-2 text-lg font-semibold text-white">{{ taskOrchestrationPreview.currentStageLabel }}</div>
+                  </div>
+                  <div class="rounded-2xl bg-white/5 border border-white/10 px-4 py-4">
+                    <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('taskDetail.orchestrationActiveSubtasks') }}</div>
+                    <div class="mt-2 text-lg font-semibold text-white">{{ taskOrchestrationPreview.activeSubtaskCount }}</div>
+                  </div>
+                  <div class="rounded-2xl bg-white/5 border border-white/10 px-4 py-4">
+                    <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('taskDetail.orchestrationLastProgress') }}</div>
+                    <div class="mt-2 text-lg font-semibold text-white">{{ taskOrchestrationPreview.lastProgressLabel }}</div>
+                  </div>
+                </div>
+
+                <div v-if="taskOrchestrationPreview.hasRun && taskOrchestrationPreview.latestEventMessage" class="mt-4 rounded-2xl border border-white/10 bg-black/20 px-4 py-4">
+                  <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('taskDetail.orchestrationLatestEvent') }}</div>
+                  <div class="mt-2 text-white font-semibold">{{ taskOrchestrationPreview.latestEventMessage }}</div>
+                  <div v-if="taskOrchestrationPreview.latestEventAtLabel" class="mt-1 text-sm text-slate-400">
+                    {{ taskOrchestrationPreview.latestEventAtLabel }}
+                  </div>
+                </div>
+              </div>
 
               <!-- Terminal/Output Area -->
               <div class="glass-panel rounded-2xl overflow-hidden flex flex-col h-[600px] border border-cyber-primary/20 shadow-[0_0_30px_rgba(0,0,0,0.3)]">
@@ -1108,6 +1555,7 @@ onBeforeUnmount(() => {
                      <h3 class="text-lg font-bold text-white">{{ t('taskDetail.analysisResultsRoutes') }}</h3>
                      <div class="flex items-center gap-3">
                        <button
+                        v-if="selectedTaskCanWrite"
                         @click="runGapCheck(selectedTask.id, 'init')"
                         :disabled="!canGapCheckStage(selectedTask, 'init') || isStageActionPending('init', 'gap-check')"
                         class="px-4 py-2 bg-white/5 hover:bg-white/10 text-slate-100 border border-white/10 rounded-lg font-bold text-sm flex items-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1154,6 +1602,7 @@ onBeforeUnmount(() => {
                     {{ selectedTask.result }}
                     <div class="mt-4 pt-4 border-t border-white/10">
                       <button
+                        v-if="selectedTaskCanWrite"
                         @click="repairJSON(selectedTask.id, 'init')"
                         :disabled="isRepairing"
                         class="px-4 py-2 bg-cyber-primary/10 hover:bg-cyber-primary/20 text-cyber-primary border border-cyber-primary/30 rounded flex items-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1172,19 +1621,126 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
+            <div v-if="currentView === 'task-orchestration' && selectedTask" class="space-y-6 max-w-7xl mx-auto animate-slide-up">
+              <div class="glass-panel p-6 rounded-2xl flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4">
+                <div>
+                  <div class="flex items-center gap-2 mb-1">
+                    <button @click="goDashboard()" class="text-slate-400 hover:text-white transition-colors text-sm flex items-center gap-1">
+                      <LayoutDashboard class="w-3 h-3" /> {{ t('app.dashboard') }}
+                    </button>
+                    <span class="text-slate-600">/</span>
+                    <span class="text-cyber-primary text-sm font-mono">{{ selectedTask.id.substring(0, 8) }}...</span>
+                  </div>
+                  <h1 class="text-3xl font-bold text-white">{{ selectedTask.name }}</h1>
+                  <p class="text-slate-400 mt-1">{{ selectedTask.remark }}</p>
+                  <div class="mt-3 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
+                    <Building2 class="w-3.5 h-3.5 text-cyan-300" />
+                    {{ taskOrganizationName(selectedTask) }}
+                  </div>
+                  <div class="mt-5 flex flex-wrap gap-2">
+                    <button
+                      v-for="tab in taskPrimaryTabs"
+                      :key="tab.key"
+                      @click="currentView = tab.key"
+                      :class="[
+                        'px-4 py-2 rounded-xl border text-sm font-semibold transition-colors flex items-center gap-2',
+                        currentView === tab.key
+                          ? 'bg-cyber-primary/12 text-cyber-primary border-cyber-primary/30'
+                          : 'bg-white/5 text-slate-300 border-white/10 hover:bg-white/10 hover:text-white'
+                      ]"
+                    >
+                      <span>{{ tab.label }}</span>
+                      <span v-if="tab.badge !== undefined" class="px-2 py-0.5 rounded-full bg-black/20 text-xs text-slate-300 border border-white/10">
+                        {{ tab.badge }}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="flex flex-wrap gap-3">
+                  <button
+                    v-if="canRequestTaskStart(selectedTask)"
+                    @click="taskAction(selectedTask.id, 'start')"
+                    class="glass-button px-5 py-2.5 rounded-lg flex items-center gap-2"
+                  >
+                    <Play class="w-4 h-4" />
+                    {{ taskStartActionLabel(selectedTask) }}
+                  </button>
+                  <button
+                    v-if="selectedTaskCanWrite && selectedTask.status === 'running'"
+                    @click="taskAction(selectedTask.id, 'pause')"
+                    class="px-5 py-2.5 bg-yellow-500/20 text-yellow-400 border border-yellow-500/50 hover:bg-yellow-500/30 rounded-lg font-bold flex items-center gap-2 transition-all"
+                  >
+                    <Pause class="w-4 h-4" /> {{ t('common.pause') }}
+                  </button>
+                  <button
+                    v-if="selectedTaskCanWrite && selectedTask.status === 'paused'"
+                    @click="taskAction(selectedTask.id, 'resume')"
+                    class="glass-button px-5 py-2.5 rounded-lg flex items-center gap-2"
+                  >
+                    <Play class="w-4 h-4" /> {{ t('common.resume') }}
+                  </button>
+                  <button
+                    v-if="canDelete"
+                    @click="deleteTask(selectedTask.id)"
+                    class="px-5 py-2.5 bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 rounded-lg font-bold flex items-center gap-2 transition-all"
+                  >
+                    <Trash2 class="w-4 h-4" /> {{ t('common.delete') }}
+                  </button>
+                </div>
+              </div>
+
+              <TaskOrchestrationWorkbench
+                :task-id="selectedTask.id"
+                :task="selectedTask"
+                :api-url="API_URL"
+                :auth-token="authKey"
+                :locale="locale"
+                :t="t"
+                :start-pending="isStartFlowPending"
+                :stage-issue-summaries="stageErrorSummaries"
+                :can-write="selectedTaskCanWrite"
+                @refresh-task="fetchTaskDetail(selectedTask.id, { silent: true })"
+                @request-start="requestTaskStart(selectedTask)"
+                @open-stage-console="openStageConsole"
+              />
+            </div>
+
             <!-- Task Report View -->
             <div v-if="currentView === 'task-report' && selectedTask" class="space-y-6 max-w-7xl mx-auto animate-slide-up">
               <div class="glass-panel p-6 rounded-2xl flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4">
                 <div>
                   <div class="flex items-center gap-2 mb-1">
-                    <button @click="currentView = 'task-detail'" class="text-slate-400 hover:text-white transition-colors text-sm flex items-center gap-1">
-                      <LayoutDashboard class="w-3 h-3" /> {{ t('common.backToTask') }}
+                    <button @click="goDashboard()" class="text-slate-400 hover:text-white transition-colors text-sm flex items-center gap-1">
+                      <LayoutDashboard class="w-3 h-3" /> {{ t('app.dashboard') }}
                     </button>
                     <span class="text-slate-600">/</span>
-                    <span class="text-slate-300 text-sm font-mono">{{ t('taskDetail.reportExport') }}</span>
+                    <span class="text-cyber-primary text-sm font-mono">{{ selectedTask.id.substring(0, 8) }}...</span>
                   </div>
                   <h1 class="text-3xl font-bold text-white">{{ t('reportView.title') }}</h1>
                   <p class="text-slate-400 mt-1">{{ t('reportView.subtitle') }}</p>
+                  <div class="mt-3 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
+                    <Building2 class="w-3.5 h-3.5 text-cyan-300" />
+                    {{ selectedTask.name }} / {{ taskOrganizationName(selectedTask) }}
+                  </div>
+                  <div class="mt-5 flex flex-wrap gap-2">
+                    <button
+                      v-for="tab in taskPrimaryTabs"
+                      :key="tab.key"
+                      @click="currentView = tab.key"
+                      :class="[
+                        'px-4 py-2 rounded-xl border text-sm font-semibold transition-colors flex items-center gap-2',
+                        currentView === tab.key
+                          ? 'bg-cyber-primary/12 text-cyber-primary border-cyber-primary/30'
+                          : 'bg-white/5 text-slate-300 border-white/10 hover:bg-white/10 hover:text-white'
+                      ]"
+                    >
+                      <span>{{ tab.label }}</span>
+                      <span v-if="tab.badge !== undefined" class="px-2 py-0.5 rounded-full bg-black/20 text-xs text-slate-300 border border-white/10">
+                        {{ tab.badge }}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
                 <div class="flex flex-wrap gap-3 w-full xl:w-auto">
@@ -1387,6 +1943,7 @@ onBeforeUnmount(() => {
               :revalidate-pending="isStageActionPending(currentAuditDefinition.key, 'revalidate')"
               :can-gap-check="canGapCheckStage(selectedTask, currentAuditDefinition.key)"
               :can-revalidate="canRevalidateStage(selectedTask, currentAuditDefinition.key)"
+              :can-write="selectedTaskCanWrite"
               @back="currentView = 'task-detail'"
               @update:activeTab="activeTab = $event"
               @run="runStage(selectedTask.id, currentAuditDefinition.key)"
@@ -1398,9 +1955,101 @@ onBeforeUnmount(() => {
           </div>
         </main>
 
+        <transition name="fade">
+          <div v-if="rerunModalOpen && selectedTask && selectedTaskCanWrite" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div class="absolute inset-0 bg-black/80 backdrop-blur-sm" @click="closeRerunModal"></div>
+
+            <div class="relative z-10 w-full max-w-2xl glass-panel rounded-2xl p-8 border-t border-cyber-primary/30 shadow-[0_0_50px_rgba(0,0,0,0.5)] animate-slide-up">
+              <button @click="closeRerunModal" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors">
+                <XCircle class="w-6 h-6" />
+              </button>
+
+              <div class="mb-6">
+                <h2 class="text-2xl font-bold text-white">
+                  {{ t('taskDetail.rerunTitle') }}
+                </h2>
+                <p class="text-slate-400 mt-2">
+                  {{ t('taskDetail.rerunDescription') }}
+                </p>
+              </div>
+
+              <div class="flex flex-wrap gap-2 mb-5">
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-sm text-slate-200 hover:bg-white/10 transition-colors"
+                  @click="selectFailedRerunStages"
+                >
+                  {{ t('taskDetail.rerunFailedStages') }}
+                </button>
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-sm text-slate-200 hover:bg-white/10 transition-colors"
+                  @click="selectAllAuditRerunStages"
+                >
+                  {{ t('taskDetail.rerunAllStages') }}
+                </button>
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-sm text-slate-200 hover:bg-white/10 transition-colors"
+                  @click="clearRerunStages"
+                >
+                  {{ t('taskDetail.rerunClear') }}
+                </button>
+              </div>
+
+              <div class="space-y-3 max-h-[420px] overflow-auto pr-1">
+                <label
+                  v-for="option in rerunStageOptions"
+                  :key="option.key"
+                  class="flex items-start gap-4 rounded-2xl border border-white/10 bg-black/20 px-4 py-4 hover:bg-white/5 transition-colors cursor-pointer"
+                >
+                  <input
+                    v-model="rerunSelection"
+                    type="checkbox"
+                    :value="option.key"
+                    class="mt-1 h-4 w-4 rounded border-white/20 bg-slate-950 text-cyan-400 focus:ring-cyan-400"
+                  >
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center justify-between gap-3 flex-wrap">
+                      <div class="text-white font-semibold">{{ option.label }}</div>
+                      <span :class="['inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold uppercase', statusBadgeClass(option.status)]">
+                        {{ displayStatus(option.status) }}
+                      </span>
+                    </div>
+                    <div class="mt-2 text-sm text-slate-400">{{ option.detail }}</div>
+                    <div v-if="option.updatedAt" class="mt-1 text-xs text-slate-500">{{ option.updatedAt }}</div>
+                  </div>
+                </label>
+              </div>
+
+              <div v-if="rerunModalError" class="mt-5 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                {{ rerunModalError }}
+              </div>
+
+              <div class="mt-6 flex flex-wrap justify-end gap-3">
+                <button
+                  type="button"
+                  class="px-4 py-2.5 rounded-xl border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-colors"
+                  @click="closeRerunModal"
+                >
+                  {{ t('taskDetail.rerunCancel') }}
+                </button>
+                <button
+                  type="button"
+                  class="px-5 py-2.5 rounded-xl bg-cyber-primary text-black font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+                  :disabled="isStartFlowPending || rerunSelection.length === 0"
+                  @click="submitRerunSelection"
+                >
+                  {{ isStartFlowPending ? t('taskDetail.rerunStarting') : t('taskDetail.rerunStart') }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </transition>
+
         <!-- Upload Modal -->
         <transition name="fade">
-          <div v-if="showUploadModal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div v-if="showUploadModal && canCreateProject" class="fixed inset-0 z-50 flex items-center justify-center p-4">
             <div class="absolute inset-0 bg-black/80 backdrop-blur-sm" @click="showUploadModal = false"></div>
 
             <div class="relative z-10 w-full max-w-lg glass-panel rounded-2xl p-8 border-t border-cyber-primary/30 shadow-[0_0_50px_rgba(0,0,0,0.5)] animate-slide-up">
@@ -1413,7 +2062,7 @@ onBeforeUnmount(() => {
                   <Upload class="w-6 h-6" />
                 </div>
                 <h2 class="text-2xl font-bold text-white">{{ t('upload.title') }}</h2>
-                <p class="text-slate-400">{{ t('upload.subtitle') }}</p>
+                <p class="text-slate-400 mt-2">{{ t('upload.subtitle') }}</p>
               </div>
 
               <div class="space-y-6">
@@ -1425,6 +2074,23 @@ onBeforeUnmount(() => {
                 <div class="space-y-2">
                   <label class="text-sm font-medium text-slate-300">{{ t('upload.remarksOptional') }}</label>
                   <textarea v-model="uploadForm.remark" rows="3" class="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-xl focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary outline-none transition-all text-white placeholder-slate-600"></textarea>
+                </div>
+
+                <div class="space-y-2">
+                  <label class="text-sm font-medium text-slate-300">{{ t('upload.organization') }}</label>
+                  <select
+                    v-model="uploadForm.organization_id"
+                    class="w-full px-4 py-3 bg-slate-900/80 border border-slate-600 rounded-xl focus:border-cyber-primary focus:ring-1 focus:ring-cyber-primary outline-none transition-all text-white"
+                  >
+                    <option value="" disabled>{{ t('upload.selectOrganization') }}</option>
+                    <option
+                      v-for="organization in writableOrganizations"
+                      :key="organization.id"
+                      :value="String(organization.id)"
+                    >
+                      {{ organization.displayName }}
+                    </option>
+                  </select>
                 </div>
 
                 <div class="space-y-2">

@@ -15,10 +15,6 @@ const props = defineProps({
     type: String,
     default: '',
   },
-  locale: {
-    type: String,
-    default: 'zh',
-  },
   t: {
     type: Function,
     required: true,
@@ -55,10 +51,7 @@ const stageCards = computed(() => {
       ...definition,
       stage,
       status,
-      findingCount,
-      rejectedCount,
       detail,
-      updatedAt: stage?.updated_at ? new Date(stage.updated_at).toLocaleString(props.locale === 'en' ? 'en-US' : 'zh-CN') : '',
       active: props.currentView === definition.view,
     }
   })
@@ -83,33 +76,36 @@ function statusBadgeClass(status) {
 </script>
 
 <template>
-  <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+  <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
     <button
       v-for="card in stageCards"
       :key="card.key"
       type="button"
       @click="emit('select-stage', card.view)"
+      :title="card.label"
       :class="[
-        'group relative overflow-hidden rounded-2xl border bg-black/25 p-5 text-left transition-all duration-300 hover:-translate-y-0.5 hover:bg-white/5',
+        'group relative min-w-0 overflow-hidden rounded-xl border bg-black/25 p-4 text-left transition-all duration-300 hover:-translate-y-0.5 hover:bg-white/5',
         card.cardClass,
         card.active ? 'ring-1 ring-white/20 border-white/20' : 'border-white/10'
       ]"
     >
       <div :class="['absolute inset-0 bg-gradient-to-br opacity-80', card.gradientClass]"></div>
-      <div class="relative z-10">
-        <div class="flex items-start justify-between gap-3">
-          <div :class="['rounded-2xl border p-3', card.iconClass]">
-            <component :is="card.icon" class="w-5 h-5" />
+      <div class="relative z-10 min-w-0">
+        <div class="flex min-w-0 flex-wrap items-start gap-3">
+          <div :class="['shrink-0 rounded-lg border p-2.5', card.iconClass]">
+            <component :is="card.icon" class="h-4 w-4" />
           </div>
-          <span :class="['rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide', statusBadgeClass(card.status)]">
+          <div class="min-w-0 flex-1">
+            <div class="break-words text-sm font-semibold leading-5 text-white">
+              {{ card.shortLabel || card.label }}
+            </div>
+            <div class="mt-1 text-xs leading-5 text-slate-300 break-words">
+              {{ card.detail }}
+            </div>
+          </div>
+          <span :class="['max-w-full rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase leading-none tracking-wide break-words', statusBadgeClass(card.status)]">
             {{ displayStatus(card.status) }}
           </span>
-        </div>
-
-        <div class="mt-4">
-          <div class="text-sm font-semibold text-white">{{ card.label }}</div>
-          <div class="mt-2 text-sm text-slate-300">{{ card.detail }}</div>
-          <div class="mt-3 text-xs text-slate-500 min-h-4">{{ card.updatedAt || t('taskStrip.noCompletedRunYet') }}</div>
         </div>
       </div>
     </button>

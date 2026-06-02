@@ -24,6 +24,13 @@ var (
 		err := database.DB.Model(&model.Task{}).Where("id = ?", taskID).Count(&count).Error
 		return count > 0, err
 	}
+	authorizeOrchestrationTaskRead = func(c *gin.Context, taskID string) bool {
+		_, ok := loadReadableTask(c, taskID, nil)
+		return ok
+	}
+	authorizeOrchestrationTaskWrite = func(c *gin.Context, taskID string) (model.Task, bool) {
+		return loadWritableTask(c, taskID, nil)
+	}
 	loadOrchestrationSnapshot = func(taskID string) (*orchestration.Snapshot, error) {
 		return orchestration.DefaultManager().Snapshot(taskID)
 	}
@@ -38,6 +45,9 @@ var (
 	}
 	subscribeOrchestrationEvents = func(taskID string) (<-chan model.TaskEvent, func()) {
 		return orchestration.DefaultManager().Subscribe(taskID)
+	}
+	rerunTaskOrchestration = func(taskID string, stages []string) (*orchestration.Snapshot, error) {
+		return orchestration.DefaultManager().RerunSelected(taskID, stages)
 	}
 )
 
@@ -54,19 +64,21 @@ func ensureOrchestrationTaskExists(c *gin.Context, taskID string) bool {
 	return true
 }
 
+func ensureOrchestrationTaskReadable(c *gin.Context, taskID string) bool {
+	if !ensureOrchestrationTaskExists(c, taskID) {
+		return false
+	}
+	return authorizeOrchestrationTaskRead(c, taskID)
+}
+
 func StartOrchestrationHandler(c *gin.Context) {
 	taskID := c.Param("id")
+	task, ok := authorizeOrchestrationTaskWrite(c, taskID)
+	if !ok {
+		return
+	}
 
 	if !config.Orchestration.Enabled {
-		var task model.Task
-		if err := database.DB.First(&task, "id = ?", taskID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
 		if task.Status == "running" {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("task %s is already running", taskID)})
 			return
@@ -100,9 +112,49 @@ func StartOrchestrationHandler(c *gin.Context) {
 	}
 }
 
-func GetOrchestrationSnapshotHandler(c *gin.Context) {
+type rerunOrchestrationRequest struct {
+	SelectedStages []string `json:"selected_stages"`
+}
+
+func RerunOrchestrationHandler(c *gin.Context) {
 	taskID := c.Param("id")
 	if !ensureOrchestrationTaskExists(c, taskID) {
+		return
+	}
+	if _, ok := authorizeOrchestrationTaskWrite(c, taskID); !ok {
+		return
+	}
+
+	var req rerunOrchestrationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid rerun request"})
+		return
+	}
+	if len(req.SelectedStages) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one stage must be selected"})
+		return
+	}
+	for _, stage := range req.SelectedStages {
+		if !isSupportedStageName(stage) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Unsupported stage %q", stage)})
+			return
+		}
+	}
+
+	snapshot, err := rerunTaskOrchestration(taskID, req.SelectedStages)
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	case err != nil:
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, snapshot)
+	}
+}
+
+func GetOrchestrationSnapshotHandler(c *gin.Context) {
+	taskID := c.Param("id")
+	if !ensureOrchestrationTaskReadable(c, taskID) {
 		return
 	}
 
@@ -116,7 +168,7 @@ func GetOrchestrationSnapshotHandler(c *gin.Context) {
 
 func GetOrchestrationSubtasksHandler(c *gin.Context) {
 	taskID := c.Param("id")
-	if !ensureOrchestrationTaskExists(c, taskID) {
+	if !ensureOrchestrationTaskReadable(c, taskID) {
 		return
 	}
 
@@ -130,7 +182,7 @@ func GetOrchestrationSubtasksHandler(c *gin.Context) {
 
 func GetOrchestrationAgentsHandler(c *gin.Context) {
 	taskID := c.Param("id")
-	if !ensureOrchestrationTaskExists(c, taskID) {
+	if !ensureOrchestrationTaskReadable(c, taskID) {
 		return
 	}
 
@@ -146,7 +198,7 @@ func OrchestrationEventsHandler(c *gin.Context) {
 	taskID := c.Param("id")
 	after, _ := strconv.ParseUint(c.Query("after"), 10, 64)
 
-	if !ensureOrchestrationTaskExists(c, taskID) {
+	if !ensureOrchestrationTaskReadable(c, taskID) {
 		return
 	}
 

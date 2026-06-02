@@ -71,6 +71,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  canWrite: {
+    type: Boolean,
+    default: false,
+  },
 })
 
 const emit = defineEmits(['back', 'run', 'gap-check', 'revalidate', 'repair', 'update:activeTab'])
@@ -260,6 +264,7 @@ function toggleDetails(key) {
 
       <div class="flex flex-wrap gap-3">
         <button
+          v-if="canWrite"
           type="button"
           @click="emit('run')"
           :disabled="taskRunning"
@@ -269,6 +274,7 @@ function toggleDetails(key) {
           {{ taskRunning ? t('auditView.auditInProgress') : t('auditView.runAudit', { stage: stageDefinition.shortLabel }) }}
         </button>
         <button
+          v-if="canWrite"
           type="button"
           @click="emit('gap-check')"
           :disabled="!canGapCheck || gapCheckPending || taskRunning"
@@ -278,6 +284,7 @@ function toggleDetails(key) {
           {{ gapCheckPending ? t('auditView.gapChecking') : t('auditView.gapCheck') }}
         </button>
         <button
+          v-if="canWrite"
           type="button"
           @click="emit('revalidate')"
           :disabled="!canRevalidate || revalidatePending || taskRunning"
@@ -397,7 +404,7 @@ function toggleDetails(key) {
               <CheckCircle class="w-12 h-12 mx-auto mb-2 opacity-50" />
               <p>{{ t('auditView.noVulnsFound', { stage: stageDefinition.shortLabel }) }}</p>
               <button
-                v-if="rawResult && rawResult.length > 50"
+                v-if="canWrite && rawResult && rawResult.length > 50"
                 @click="emit('repair')"
                 :disabled="isRepairing"
                 class="mt-4 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 text-xs rounded border border-white/5 transition-colors disabled:opacity-50 inline-flex items-center gap-2"
@@ -444,6 +451,7 @@ function toggleDetails(key) {
             </div>
 
             <button
+              v-if="canWrite"
               @click="emit('repair')"
               :disabled="isRepairing"
               class="px-5 py-2.5 bg-cyber-primary/10 hover:bg-cyber-primary/20 text-cyber-primary border border-cyber-primary/30 rounded-lg flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,243,255,0.1)]"
@@ -458,6 +466,7 @@ function toggleDetails(key) {
           {{ rawResult }}
           <div class="mt-4 pt-4 border-t border-white/10">
             <button
+              v-if="canWrite"
               @click="emit('repair')"
               :disabled="isRepairing"
               class="px-4 py-2 bg-white/10 hover:bg-white/20 text-white border border-white/10 rounded flex items-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"

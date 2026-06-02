@@ -1,248 +1,207 @@
 package handler
 
 import (
-	"errors"
+	"archive/zip"
+	"bytes"
+	"encoding/json"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 
 	"codescan/internal/config"
+	"codescan/internal/database"
 	"codescan/internal/model"
+	"codescan/internal/utils"
 )
 
-func TestAutoStartUploadedTaskStartsOrchestrationWhenEnabled(t *testing.T) {
-	task := &model.Task{ID: "task-1", Logs: []string{}}
+func TestUploadHandlerRejectsOversizedFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
-	legacyCalled := false
-	restore := setUploadStartTestDeps(t, uploadStartTestDeps{
-		orchestrationEnabled: true,
-		startOrchestration: func(taskID string) error {
-			if taskID != "task-1" {
-				t.Fatalf("expected orchestration start for task-1, got %s", taskID)
-			}
-			return nil
-		},
-		startLegacy: func(*model.Task) {
-			legacyCalled = true
-		},
-		loadStatus: func(string) (string, error) {
-			t.Fatalf("loadStatus should not be called on successful orchestration start")
-			return "", nil
-		},
-		saveTask: func(*model.Task) error {
-			t.Fatalf("saveTask should not be called on successful orchestration start")
-			return nil
-		},
-		updateStatus: func(string, string) error {
-			t.Fatalf("updateStatus should not be called when orchestration is enabled")
-			return nil
-		},
-		now: func() time.Time {
-			return time.Unix(0, 0)
-		},
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("name", "oversized"); err != nil {
+		t.Fatalf("WriteField(name) error = %v", err)
+	}
+	if err := writer.WriteField("remark", "test"); err != nil {
+		t.Fatalf("WriteField(remark) error = %v", err)
+	}
+	part, err := writer.CreateFormFile("file", "source.zip")
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write([]byte("zip")); err != nil {
+		t.Fatalf("file part write error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("multipart writer close error = %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	setTestCurrentUser(c)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if err := req.ParseMultipartForm(int64(body.Len()) + 1024); err != nil {
+		t.Fatalf("ParseMultipartForm() error = %v", err)
+	}
+	req.MultipartForm.File["file"][0].Size = utils.MaxUploadFileSize + 1
+	c.Request = req
+
+	UploadHandler(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "200MB") {
+		t.Fatalf("expected upload size limit to mention 200MB, got %s", w.Body.String())
+	}
+}
+
+func TestUploadHandlerCreatesPendingTaskWithoutAutoStart(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	root := t.TempDir()
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWd)
 	})
-	defer restore()
-
-	if err := autoStartUploadedTask(task); err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	if err := os.MkdirAll(config.ProjectsDir, 0755); err != nil {
+		t.Fatalf("MkdirAll(projects) error = %v", err)
 	}
-	if task.Status != "running" {
-		t.Fatalf("expected task status running, got %s", task.Status)
+
+	previousDB := database.DB
+	db, err := gorm.Open(sqlite.Open(filepath.Join(root, "upload.sqlite")), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
 	}
-	if legacyCalled {
-		t.Fatalf("expected legacy scan not to start when orchestration is enabled")
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("unwrap sqlite database: %v", err)
 	}
-}
-
-func TestAutoStartUploadedTaskFallsBackToLegacyInitWhenOrchestrationDisabled(t *testing.T) {
-	task := &model.Task{ID: "task-2", Logs: []string{}}
-
-	legacyCalled := false
-	var updatedTaskID string
-	var updatedStatus string
-
-	restore := setUploadStartTestDeps(t, uploadStartTestDeps{
-		orchestrationEnabled: false,
-		startOrchestration: func(string) error {
-			t.Fatalf("orchestration start should not be called when disabled")
-			return nil
-		},
-		startLegacy: func(started *model.Task) {
-			legacyCalled = true
-			if started != task {
-				t.Fatalf("expected legacy starter to receive the same task pointer")
-			}
-		},
-		loadStatus: func(string) (string, error) {
-			t.Fatalf("loadStatus should not be called when orchestration is disabled")
-			return "", nil
-		},
-		saveTask: func(*model.Task) error {
-			t.Fatalf("saveTask should not be called for disabled fallback success path")
-			return nil
-		},
-		updateStatus: func(taskID, status string) error {
-			updatedTaskID = taskID
-			updatedStatus = status
-			return nil
-		},
-		now: func() time.Time {
-			return time.Unix(0, 0)
-		},
+	if err := db.AutoMigrate(&model.Organization{}, &model.OrganizationMembership{}, &model.Task{}, &model.TaskStage{}); err != nil {
+		t.Fatalf("auto-migrate sqlite schema: %v", err)
+	}
+	database.DB = db
+	t.Cleanup(func() {
+		database.DB = previousDB
+		_ = sqlDB.Close()
 	})
-	defer restore()
 
-	if err := autoStartUploadedTask(task); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if task.Status != "running" {
-		t.Fatalf("expected task status running, got %s", task.Status)
-	}
-	if !legacyCalled {
-		t.Fatalf("expected legacy init scan to start when orchestration is disabled")
-	}
-	if updatedTaskID != "task-2" || updatedStatus != "running" {
-		t.Fatalf("expected persisted status update to running for task-2, got %s %s", updatedTaskID, updatedStatus)
-	}
-}
-
-func TestAutoStartUploadedTaskTreatsRunningStatusAsSuccessfulStart(t *testing.T) {
-	task := &model.Task{ID: "task-3", Logs: []string{}}
-
-	restore := setUploadStartTestDeps(t, uploadStartTestDeps{
-		orchestrationEnabled: true,
-		startOrchestration: func(string) error {
-			return errors.New("snapshot failed after run creation")
-		},
-		startLegacy: func(*model.Task) {
-			t.Fatalf("legacy scan should not be used when orchestration already started")
-		},
-		loadStatus: func(taskID string) (string, error) {
-			if taskID != "task-3" {
-				t.Fatalf("expected status check for task-3, got %s", taskID)
-			}
-			return "running", nil
-		},
-		saveTask: func(*model.Task) error {
-			t.Fatalf("saveTask should not be called when the task is already running")
-			return nil
-		},
-		updateStatus: func(string, string) error {
-			t.Fatalf("updateStatus should not be called in orchestration mode")
-			return nil
-		},
-		now: func() time.Time {
-			return time.Unix(0, 0)
-		},
+	oldTaskID := newTaskID
+	newTaskID = func() string { return "task-pending" }
+	t.Cleanup(func() {
+		newTaskID = oldTaskID
 	})
-	defer restore()
 
-	if err := autoStartUploadedTask(task); err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	org := model.Organization{Name: "Engineering", Path: "/1/", Depth: 0}
+	if err := database.DB.Create(&org).Error; err != nil {
+		t.Fatalf("create organization: %v", err)
 	}
-	if task.Status != "running" {
-		t.Fatalf("expected task status running, got %s", task.Status)
+	if err := database.DB.Model(&org).Update("path", "/1/").Error; err != nil {
+		t.Fatalf("update organization path: %v", err)
 	}
-	if task.Result != "" {
-		t.Fatalf("expected task result to remain empty, got %q", task.Result)
-	}
-}
 
-func TestAutoStartUploadedTaskMarksTaskFailedWhenStartFails(t *testing.T) {
-	task := &model.Task{ID: "task-4", Logs: []string{}}
-
-	persisted := false
-	now := time.Date(2026, 4, 21, 10, 11, 12, 0, time.UTC)
-	restore := setUploadStartTestDeps(t, uploadStartTestDeps{
-		orchestrationEnabled: true,
-		startOrchestration: func(string) error {
-			return errors.New("planner boot failed")
-		},
-		startLegacy: func(*model.Task) {
-			t.Fatalf("legacy scan should not be used when orchestration start fails")
-		},
-		loadStatus: func(string) (string, error) {
-			return "pending", nil
-		},
-		saveTask: func(saved *model.Task) error {
-			persisted = true
-			if saved.Status != "failed" {
-				t.Fatalf("expected persisted status failed, got %s", saved.Status)
-			}
-			if !strings.Contains(saved.Result, "Automatic orchestration failed to start: planner boot failed") {
-				t.Fatalf("expected failure result to describe orchestration start error, got %q", saved.Result)
-			}
-			if len(saved.Logs) != 1 {
-				t.Fatalf("expected one failure log, got %d", len(saved.Logs))
-			}
-			if !strings.Contains(saved.Logs[0], "[10:11:12] Automatic orchestration failed to start: planner boot failed") {
-				t.Fatalf("unexpected failure log entry: %q", saved.Logs[0])
-			}
-			return nil
-		},
-		updateStatus: func(string, string) error {
-			t.Fatalf("updateStatus should not be called when orchestration is enabled")
-			return nil
-		},
-		now: func() time.Time {
-			return now
-		},
+	body, contentType := buildUploadRequestBody(t, "demo.zip", map[string]string{
+		"main.go": "package main\nfunc main() {}\n",
 	})
-	defer restore()
 
-	if err := autoStartUploadedTask(task); err != nil {
-		t.Fatalf("expected no error after persisting failed state, got %v", err)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	setTestCurrentUser(c)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/tasks", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", contentType)
+
+	UploadHandler(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, w.Code, w.Body.String())
 	}
-	if !persisted {
-		t.Fatalf("expected failed task state to be persisted")
+
+	var payload model.Task
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal upload response: %v", err)
 	}
-	if task.Status != "failed" {
-		t.Fatalf("expected task status failed, got %s", task.Status)
+	if payload.ID != "task-pending" {
+		t.Fatalf("expected task id task-pending, got %q", payload.ID)
 	}
-	if !strings.Contains(task.Result, "Automatic orchestration failed to start: planner boot failed") {
-		t.Fatalf("expected task result to describe orchestration start error, got %q", task.Result)
+	if payload.Status != "pending" {
+		t.Fatalf("expected pending task after upload, got %q", payload.Status)
 	}
-	if len(task.Logs) != 1 {
-		t.Fatalf("expected one failure log on task, got %d", len(task.Logs))
+
+	var saved model.Task
+	if err := database.DB.First(&saved, "id = ?", "task-pending").Error; err != nil {
+		t.Fatalf("expected task to be persisted: %v", err)
+	}
+	if saved.Status != "pending" {
+		t.Fatalf("expected persisted task pending, got %q", saved.Status)
+	}
+	if saved.OrganizationID == nil || *saved.OrganizationID != org.ID {
+		t.Fatalf("expected persisted task organization %d, got %v", org.ID, saved.OrganizationID)
+	}
+	if _, err := os.Stat(filepath.Join(config.ProjectsDir, "task-pending", "main.go")); err != nil {
+		t.Fatalf("expected project files to be extracted: %v", err)
 	}
 }
 
-type uploadStartTestDeps struct {
-	orchestrationEnabled bool
-	startOrchestration   func(taskID string) error
-	startLegacy          func(task *model.Task)
-	loadStatus           func(taskID string) (string, error)
-	saveTask             func(task *model.Task) error
-	updateStatus         func(taskID, status string) error
-	now                  func() time.Time
-}
-
-func setUploadStartTestDeps(t *testing.T, deps uploadStartTestDeps) func() {
+func buildUploadRequestBody(t *testing.T, filename string, files map[string]string) ([]byte, string) {
 	t.Helper()
 
-	oldCfg := config.Orchestration
-	oldStartOrchestration := launchTaskOrchestration
-	oldStartLegacy := launchLegacyInitScan
-	oldLoadStatus := loadTaskStatus
-	oldPersistTask := persistTask
-	oldPersistTaskStatus := persistTaskStatus
-	oldTaskLogClock := taskLogClock
-
-	config.Orchestration = config.OrchestrationConfig{Enabled: deps.orchestrationEnabled}
-	launchTaskOrchestration = deps.startOrchestration
-	launchLegacyInitScan = deps.startLegacy
-	loadTaskStatus = deps.loadStatus
-	persistTask = deps.saveTask
-	persistTaskStatus = deps.updateStatus
-	taskLogClock = deps.now
-
-	return func() {
-		config.Orchestration = oldCfg
-		launchTaskOrchestration = oldStartOrchestration
-		launchLegacyInitScan = oldStartLegacy
-		loadTaskStatus = oldLoadStatus
-		persistTask = oldPersistTask
-		persistTaskStatus = oldPersistTaskStatus
-		taskLogClock = oldTaskLogClock
+	zipBytes := buildZipBytes(t, files)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("name", "Demo Project"); err != nil {
+		t.Fatalf("WriteField(name) error = %v", err)
 	}
+	if err := writer.WriteField("remark", "created by test"); err != nil {
+		t.Fatalf("WriteField(remark) error = %v", err)
+	}
+	if err := writer.WriteField("organization_id", "1"); err != nil {
+		t.Fatalf("WriteField(organization_id) error = %v", err)
+	}
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write(zipBytes); err != nil {
+		t.Fatalf("write zip part error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("multipart writer close error = %v", err)
+	}
+	return body.Bytes(), writer.FormDataContentType()
+}
+
+func buildZipBytes(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	for name, content := range files {
+		entry, err := writer.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := entry.Write([]byte(content)); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buffer.Bytes()
 }

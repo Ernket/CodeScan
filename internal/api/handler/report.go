@@ -8,18 +8,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
-	"codescan/internal/database"
-	"codescan/internal/model"
 	reportsvc "codescan/internal/service/report"
 )
 
 func ExportTaskReportHandler(c *gin.Context) {
 	id := c.Param("id")
 
-	var task model.Task
-	if err := database.DB.Preload("Stages").First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	task, ok := loadReadableTask(c, id, func(db *gorm.DB) *gorm.DB {
+		return db.Preload("Stages")
+	})
+	if !ok {
 		return
 	}
 

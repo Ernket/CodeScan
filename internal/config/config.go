@@ -4,6 +4,13 @@ import "encoding/json"
 
 const ProjectsDir = "projects"
 
+const (
+	defaultContextWindowTokens    = 128000
+	defaultSummaryWindowMessages  = 12
+	defaultMicrocompactKeepRecent = 2
+	defaultCompactMinTailMessages = 4
+)
+
 type DBConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -13,20 +20,32 @@ type DBConfig struct {
 }
 
 type AIConfig struct {
-	APIKey  string `json:"api_key"`
-	BaseURL string `json:"base_url"`
-	Model   string `json:"model"`
+	APIKey   string           `json:"api_key"`
+	BaseURL  string           `json:"base_url"`
+	Model    string           `json:"model"`
+	Thinking AIThinkingConfig `json:"thinking"`
+}
+
+type AIThinkingConfig struct {
+	Enabled             bool   `json:"enabled"`
+	Effort              string `json:"effort"`
+	MaxCompletionTokens int    `json:"max_completion_tokens"`
+	ApplyToAuxiliary    bool   `json:"apply_to_auxiliary"`
 }
 
 type ContextCompressionConfig struct {
-	SoftLimitTokens        int  `json:"soft_limit_tokens"`
-	HardLimitTokens        int  `json:"hard_limit_tokens"`
-	SoftLimitBytes         int  `json:"-"`
-	HardLimitBytes         int  `json:"-"`
-	SummaryWindowMessages  int  `json:"-"`
-	MicrocompactKeepRecent int  `json:"-"`
-	CompactMinTailMessages int  `json:"-"`
-	SessionMemoryEnabled   bool `json:"-"`
+	ContextWindowTokens      int  `json:"context_window_tokens"`
+	SummaryReservedTokens    int  `json:"-"`
+	SafetyBufferTokens       int  `json:"-"`
+	MicrocompactLimitTokens  int  `json:"-"`
+	FullCompactLimitTokens   int  `json:"-"`
+	HardLimitTokens          int  `json:"-"`
+	TargetAfterCompactTokens int  `json:"-"`
+	HardLimitBytes           int  `json:"-"`
+	SummaryWindowMessages    int  `json:"-"`
+	MicrocompactKeepRecent   int  `json:"-"`
+	CompactMinTailMessages   int  `json:"-"`
+	SessionMemoryEnabled     bool `json:"-"`
 }
 
 type SessionMemoryConfig struct {
@@ -108,15 +127,12 @@ func (c *OrchestrationConfig) UnmarshalJSON(data []byte) error {
 }
 
 func DefaultScannerConfig() ScannerConfig {
-	return ScannerConfig{
+	cfg := ScannerConfig{
 		ContextCompression: ContextCompressionConfig{
-			SoftLimitTokens:        22000,
-			HardLimitTokens:        34000,
-			SoftLimitBytes:         90000,
-			HardLimitBytes:         140000,
-			SummaryWindowMessages:  12,
-			MicrocompactKeepRecent: 2,
-			CompactMinTailMessages: 4,
+			ContextWindowTokens:    defaultContextWindowTokens,
+			SummaryWindowMessages:  defaultSummaryWindowMessages,
+			MicrocompactKeepRecent: defaultMicrocompactKeepRecent,
+			CompactMinTailMessages: defaultCompactMinTailMessages,
 			SessionMemoryEnabled:   true,
 		},
 		SessionMemory: SessionMemoryConfig{
@@ -127,40 +143,16 @@ func DefaultScannerConfig() ScannerConfig {
 			FailureCooldownSeconds: 300,
 		},
 	}
+	cfg.ContextCompression = deriveContextCompressionPolicy(cfg.ContextCompression)
+	return cfg
 }
 
 func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	defaults := DefaultScannerConfig()
 	warnings := []string{}
 
-	if cfg.ContextCompression.SoftLimitTokens <= 0 {
-		cfg.ContextCompression.SoftLimitTokens = defaults.ContextCompression.SoftLimitTokens
-	}
-	if cfg.ContextCompression.HardLimitTokens <= 0 {
-		cfg.ContextCompression.HardLimitTokens = defaults.ContextCompression.HardLimitTokens
-	}
-	if cfg.ContextCompression.HardLimitTokens <= cfg.ContextCompression.SoftLimitTokens {
-		cfg.ContextCompression.HardLimitTokens = defaults.ContextCompression.HardLimitTokens
-		if cfg.ContextCompression.HardLimitTokens <= cfg.ContextCompression.SoftLimitTokens {
-			cfg.ContextCompression.HardLimitTokens = cfg.ContextCompression.SoftLimitTokens + 1
-		}
-		warnings = append(warnings, "scanner_config.context_compression.hard_limit_tokens must be greater than soft_limit_tokens; falling back to a safe hard limit")
-	}
-	if cfg.ContextCompression.SoftLimitBytes <= 0 {
-		cfg.ContextCompression.SoftLimitBytes = defaults.ContextCompression.SoftLimitBytes
-	}
-	if cfg.ContextCompression.HardLimitBytes <= 0 {
-		cfg.ContextCompression.HardLimitBytes = defaults.ContextCompression.HardLimitBytes
-	}
 	if cfg.ContextCompression.SummaryWindowMessages <= 0 {
 		cfg.ContextCompression.SummaryWindowMessages = defaults.ContextCompression.SummaryWindowMessages
-	}
-	if cfg.ContextCompression.HardLimitBytes <= cfg.ContextCompression.SoftLimitBytes {
-		cfg.ContextCompression.HardLimitBytes = defaults.ContextCompression.HardLimitBytes
-		if cfg.ContextCompression.HardLimitBytes <= cfg.ContextCompression.SoftLimitBytes {
-			cfg.ContextCompression.HardLimitBytes = cfg.ContextCompression.SoftLimitBytes + 1
-		}
-		warnings = append(warnings, "scanner_config.context_compression.hard_limit_bytes must be greater than soft_limit_bytes; falling back to a safe hard limit")
 	}
 	if cfg.ContextCompression.MicrocompactKeepRecent <= 0 {
 		cfg.ContextCompression.MicrocompactKeepRecent = defaults.ContextCompression.MicrocompactKeepRecent
@@ -168,6 +160,10 @@ func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	if cfg.ContextCompression.CompactMinTailMessages <= 0 {
 		cfg.ContextCompression.CompactMinTailMessages = defaults.ContextCompression.CompactMinTailMessages
 	}
+	if cfg.ContextCompression.ContextWindowTokens <= 0 {
+		cfg.ContextCompression.ContextWindowTokens = defaults.ContextCompression.ContextWindowTokens
+	}
+	cfg.ContextCompression = deriveContextCompressionPolicy(cfg.ContextCompression)
 
 	if !cfg.SessionMemory.enabledSet {
 		cfg.SessionMemory.Enabled = defaults.SessionMemory.Enabled
@@ -187,6 +183,45 @@ func NormalizeScannerConfig(cfg ScannerConfig) (ScannerConfig, []string) {
 	cfg.ContextCompression.SessionMemoryEnabled = cfg.SessionMemory.Enabled
 
 	return cfg, warnings
+}
+
+func deriveContextCompressionPolicy(cfg ContextCompressionConfig) ContextCompressionConfig {
+	if cfg.ContextWindowTokens <= 0 {
+		cfg.ContextWindowTokens = defaultContextWindowTokens
+	}
+
+	summaryReserved := cfg.ContextWindowTokens * 12 / 100
+	summaryReserved = clampInt(summaryReserved, 8000, 20000)
+
+	safetyBuffer := cfg.ContextWindowTokens * 4 / 100
+	safetyBuffer = clampInt(safetyBuffer, 4000, 12000)
+
+	effectiveLimit := cfg.ContextWindowTokens - summaryReserved - safetyBuffer
+	if effectiveLimit < 1 {
+		effectiveLimit = cfg.ContextWindowTokens
+	}
+	if effectiveLimit < 1 {
+		effectiveLimit = defaultContextWindowTokens - 20000 - 5120
+	}
+
+	cfg.SummaryReservedTokens = summaryReserved
+	cfg.SafetyBufferTokens = safetyBuffer
+	cfg.MicrocompactLimitTokens = effectiveLimit * 75 / 100
+	cfg.FullCompactLimitTokens = effectiveLimit * 90 / 100
+	cfg.HardLimitTokens = effectiveLimit
+	cfg.TargetAfterCompactTokens = effectiveLimit * 55 / 100
+	cfg.HardLimitBytes = cfg.HardLimitTokens * 4
+	return cfg
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func DefaultOrchestrationConfig() OrchestrationConfig {

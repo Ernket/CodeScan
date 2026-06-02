@@ -7,25 +7,26 @@ import {
   Bot,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Clock3,
-  GitBranch,
   ListTree,
   Play,
   Radar,
   RefreshCw,
   Route,
+  ShieldAlert,
   ShieldCheck,
   XCircle,
 } from 'lucide-vue-next'
 
 import {
   buildActivityFeed,
-  buildInitStageCard,
+  buildExecutionQueues,
+  buildOrchestrationFlow,
   buildRolePipeline,
-  buildStageMatrixRows,
   findingSummary,
-  formatReplanReason,
+  parseRunScope,
   pickDefaultStage,
   resolveSubtaskDisplayStatus,
   sortStageSubtasks,
@@ -56,39 +57,48 @@ const props = defineProps({
     type: Function,
     required: true,
   },
+  startPending: {
+    type: Boolean,
+    default: false,
+  },
+  stageIssueSummaries: {
+    type: Array,
+    default: () => [],
+  },
+  canWrite: {
+    type: Boolean,
+    default: false,
+  },
 })
 
-const emit = defineEmits(['refresh-task'])
+const emit = defineEmits(['refresh-task', 'request-start', 'open-stage-console'])
 
 const POLL_INTERVAL_MS = 15000
 
 const snapshot = ref(createEmptySnapshot())
 const isLoading = ref(false)
-const isStarting = ref(false)
 const error = ref('')
 const selectedStage = ref('init')
 const stageSelectionMode = ref('auto')
 const activityScope = ref('selected')
 const expandedActivities = ref({})
 const lastSequence = ref(0)
-const matrixQuotaRoles = ['worker', 'integrator', 'validator', 'persistence']
 
 let eventSource = null
 let refreshTimer = null
 let pollingTimer = null
+let reconnectTimer = null
 
 const runSummary = computed(() => snapshot.value?.run || null)
 const diagnostics = computed(() => snapshot.value?.diagnostics || null)
-const initStageCard = computed(() => buildInitStageCard(snapshot.value, diagnostics.value, props.t))
-const stageMatrixRows = computed(() => buildStageMatrixRows(snapshot.value, diagnostics.value, props.t))
-const focusEntries = computed(() => [initStageCard.value, ...stageMatrixRows.value])
-const parallelismBadges = computed(() => {
-  return matrixQuotaRoles.map((role) => ({
-    role,
-    label: roleLabel(role),
-    value: diagnostics.value?.parallelism?.[role],
-  }))
-})
+const runScope = computed(() => parseRunScope(runSummary.value?.run?.summary_json))
+const orchestrationFlow = computed(() => buildOrchestrationFlow(snapshot.value, diagnostics.value, props.t))
+const executionQueues = computed(() => buildExecutionQueues(snapshot.value, diagnostics.value, props.t))
+const activeExecutionUnits = computed(() => executionQueues.value.active.slice(0, 8))
+const readyExecutionUnits = computed(() => executionQueues.value.ready.slice(0, 10))
+const waitingExecutionUnits = computed(() => executionQueues.value.waiting.slice(0, 8))
+const blockedExecutionUnits = computed(() => executionQueues.value.blocked.slice(0, 4))
+const focusEntries = computed(() => [orchestrationFlow.value.init, ...orchestrationFlow.value.auditStages])
 const selectedStageNode = computed(() => {
   return focusEntries.value.find((node) => node.stage === selectedStage.value) || focusEntries.value[0] || null
 })
@@ -109,6 +119,18 @@ const visibleActivities = computed(() => {
   }
   return activities.value.filter((activity) => !activity.stage || activity.stage === selectedStage.value)
 })
+const runScopeDetails = computed(() => {
+  if (runScope.value.mode !== 'rerun_selected') {
+    return null
+  }
+  return {
+    selected: formatStageList(runScope.value.selectedStages),
+    carried: formatStageList(runScope.value.carriedOverStages),
+    routes: props.locale === 'en'
+      ? (runScope.value.reusedRouteInventory ? 'Reused current route inventory' : 'Reran route inventory')
+      : (runScope.value.reusedRouteInventory ? '复用当前路由结果' : '本轮重新扫描路由'),
+  }
+})
 
 function createEmptySnapshot() {
   return {
@@ -126,7 +148,7 @@ function createEmptySnapshot() {
 function authConfig() {
   return {
     headers: {
-      Authorization: props.authToken,
+      Authorization: `Bearer ${props.authToken}`,
     },
   }
 }
@@ -198,7 +220,8 @@ function connectEvents() {
 
   eventSource.onerror = () => {
     closeRealtime()
-    setTimeout(() => {
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
       connectEvents()
       syncPolling()
     }, 1500)
@@ -219,6 +242,10 @@ function closeRealtime() {
   if (pollingTimer) {
     clearInterval(pollingTimer)
     pollingTimer = null
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
   }
 }
 
@@ -243,25 +270,10 @@ function syncPolling() {
   }, POLL_INTERVAL_MS)
 }
 
-async function startOrchestration() {
-  if (!props.taskId || props.task?.status === 'running') return
-  isStarting.value = true
+function requestStart() {
+  if (!props.canWrite || !props.taskId || props.task?.status === 'running' || props.startPending) return
   error.value = ''
-
-  try {
-    const { data } = await axios.post(`${props.apiUrl}/tasks/${props.taskId}/orchestration/start`, {}, authConfig())
-    snapshot.value = normalizeSnapshot(data)
-    lastSequence.value = 0
-    stageSelectionMode.value = 'auto'
-    syncSelectedStage()
-    emit('refresh-task')
-    await loadSnapshot(true)
-    connectEvents()
-  } catch (requestError) {
-    error.value = requestError.response?.data?.error || requestError.message
-  } finally {
-    isStarting.value = false
-  }
+  emit('request-start')
 }
 
 function syncSelectedStage() {
@@ -280,6 +292,10 @@ function chooseStage(stage) {
 function resetStageFocus() {
   stageSelectionMode.value = 'auto'
   syncSelectedStage()
+}
+
+function openStageConsole(view) {
+  emit('open-stage-console', view)
 }
 
 function toggleActivity(id) {
@@ -343,17 +359,35 @@ function stateBadgeClass(state) {
     case 'running':
       return 'bg-cyan-500/15 text-cyan-200 border-cyan-500/30'
     case 'waiting':
-      return 'bg-blue-500/15 text-blue-200 border-blue-500/30'
+      return 'bg-slate-500/15 text-slate-200 border-slate-500/30'
     case 'blocked':
-    case 'stalled':
     case 'paused':
       return 'bg-amber-500/15 text-amber-200 border-amber-500/30'
+    case 'stalled':
+      return diagnostics.value?.stalled
+        ? 'bg-amber-500/15 text-amber-200 border-amber-500/30'
+        : 'bg-slate-500/15 text-slate-200 border-slate-500/30'
     case 'completed':
       return 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30'
     case 'failed':
       return 'bg-rose-500/15 text-rose-200 border-rose-500/30'
     default:
       return 'bg-slate-500/10 text-slate-300 border-slate-500/20'
+  }
+}
+
+function stageIssueStatusClass(status) {
+  switch (String(status || '').trim().toLowerCase()) {
+    case 'running':
+      return 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+    case 'completed':
+      return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+    case 'failed':
+      return 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+    case 'paused':
+      return 'bg-sky-500/10 text-sky-300 border-sky-500/30'
+    default:
+      return 'bg-slate-500/10 text-slate-300 border-slate-500/30'
   }
 }
 
@@ -377,14 +411,108 @@ function roleBadgeClass(state) {
   }
 }
 
-function matrixRowClass(row) {
-  if (selectedStage.value === row.stage) {
-    return 'border-cyan-400/40 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.18)]'
+function flowNodeClass(node) {
+  const state = normalizeStateKey(node?.status)
+  const classes = ['relative w-full min-h-[136px] rounded-xl border px-4 py-4 text-left transition-all']
+
+  if (selectedStage.value === node?.stage) {
+    classes.push('border-cyan-300/55 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.22)]')
+  } else if (node?.locked) {
+    classes.push('border-white/8 bg-slate-950/25 opacity-70 hover:bg-white/[0.04]')
+  } else if (state === 'stalled') {
+    classes.push('border-amber-500/35 bg-amber-500/[0.07] hover:bg-amber-500/10')
+  } else if (node?.isCurrent || ['starting', 'running'].includes(state)) {
+    classes.push('border-cyan-500/35 bg-cyan-500/[0.08] hover:bg-cyan-500/12')
+  } else if (state === 'failed') {
+    classes.push('border-rose-500/35 bg-rose-500/[0.07] hover:bg-rose-500/10')
+  } else if (['blocked', 'paused'].includes(state)) {
+    classes.push('border-amber-500/35 bg-amber-500/[0.07] hover:bg-amber-500/10')
+  } else if (state === 'waiting') {
+    classes.push('border-slate-500/30 bg-slate-500/[0.07] hover:bg-slate-500/10')
+  } else if (state === 'completed') {
+    classes.push('border-emerald-500/30 bg-emerald-500/[0.06] hover:bg-emerald-500/10')
+  } else {
+    classes.push('border-white/10 bg-slate-950/40 hover:bg-white/5')
   }
-  if (row?.isCurrent) {
-    return 'border-white/15 bg-white/10'
+
+  return classes.join(' ')
+}
+
+function flowProgressStyle(node) {
+  const value = Math.max(0, Math.min(100, Number(node?.progressPercent || 0)))
+  return { width: `${value}%` }
+}
+
+function flowConnectorClass() {
+  const initStatus = normalizeStateKey(orchestrationFlow.value?.init?.status)
+  if (initStatus === 'completed') {
+    return 'from-emerald-400/70 via-cyan-400/45 to-cyan-400/15'
   }
-  return 'border-white/10 bg-slate-950/40 hover:bg-white/5'
+  if (['starting', 'running'].includes(initStatus)) {
+    return 'from-cyan-400/70 via-cyan-400/35 to-cyan-400/10'
+  }
+  if (['blocked', 'failed', 'paused', 'stalled'].includes(initStatus)) {
+    return 'from-amber-400/60 via-amber-400/30 to-amber-400/10'
+  }
+  return 'from-slate-600 via-slate-700/60 to-slate-800/30'
+}
+
+function queueUnitClass(unit) {
+  if (unit?.isFocus) {
+    return 'border-cyan-400/40 bg-cyan-500/10'
+  }
+  const status = normalizeRoleStateKey(unit?.status)
+  if (status === 'running' || status === 'starting') {
+    return 'border-cyan-500/25 bg-cyan-500/10'
+  }
+  if (status === 'ready') {
+    return 'border-blue-500/25 bg-blue-500/10'
+  }
+  if (unit?.status === 'waiting' || unit?.stageStatus === 'waiting') {
+    return 'border-slate-500/25 bg-slate-500/10'
+  }
+  if (status === 'paused') {
+    return 'border-amber-500/25 bg-amber-500/10'
+  }
+  if (unit?.stageStatus === 'blocked' || status === 'failed') {
+    return 'border-rose-500/25 bg-rose-500/10'
+  }
+  return 'border-white/10 bg-slate-950/50'
+}
+
+function queueUnitPrimary(unit) {
+  if (!unit) return '--'
+  if (unit.role === 'planner') return roleLabel('planner')
+  return [unit.stageLabel, unit.roleLabel].filter(Boolean).join(' / ') || unit.title || '--'
+}
+
+function queueUnitSecondary(unit) {
+  if (!unit) return '--'
+  if (unit.role === 'planner') return unit.title || '--'
+  return unit.title || unit.subtaskId || '--'
+}
+
+function queueUnitBadgeClass(unit) {
+  if (!unit) return stateBadgeClass('not_started')
+  if (!unit.role || unit.status === 'waiting' || unit.status === 'blocked' || unit.status === 'failed') {
+    return stateBadgeClass(unit.status)
+  }
+  if (unit.role === 'planner') {
+    return stateBadgeClass(unit.status)
+  }
+  return roleBadgeClass(unit.status)
+}
+
+function queueUnitStatusLabel(unit) {
+  if (!unit) return '--'
+  if (!unit.role || unit.status === 'waiting' || unit.status === 'blocked' || unit.status === 'failed') {
+    return stageStateLabel(unit.status)
+  }
+  return unit.role === 'planner' ? stageStateLabel(unit.status) : roleStateLabel(unit.status)
+}
+
+function roleQueueLoadLabel(queue) {
+  return `${queue?.active?.length || 0}/${Number(queue?.parallelism || 0)}`
 }
 
 function activityToneClass(tone) {
@@ -398,11 +526,6 @@ function activityToneClass(tone) {
     default:
       return 'text-cyan-200 bg-cyan-500/10 border-cyan-500/25'
   }
-}
-
-function formatParallelism(value) {
-  const numeric = Number(value)
-  return Number.isFinite(numeric) && numeric >= 0 ? `x${numeric}` : 'x--'
 }
 
 function activityIcon(tone) {
@@ -433,6 +556,23 @@ function formatPayload(payload) {
 
 function shortRunId(value) {
   return value ? String(value).slice(0, 10) : '--'
+}
+
+function formatStageList(stages = []) {
+  if (!Array.isArray(stages) || stages.length === 0) {
+    return '--'
+  }
+  return stages.map((stage) => stageLabel(stage)).join(' / ')
+}
+
+function startActionLabel() {
+  if (props.startPending) {
+    return props.locale === 'en' ? 'Starting...' : '正在启动...'
+  }
+  if (String(props.task?.status || '').trim().toLowerCase() === 'pending') {
+    return props.t('orchestration.start')
+  }
+  return props.locale === 'en' ? 'Select Stages to Rerun' : '选择重跑阶段'
 }
 
 function normalizeStateKey(value) {
@@ -503,6 +643,14 @@ watch(
   },
 )
 
+watch(
+  () => props.task?.status,
+  (status, previousStatus) => {
+    if (!props.taskId || status === previousStatus) return
+    loadSnapshot(true)
+  },
+)
+
 onBeforeUnmount(() => {
   closeRealtime()
 })
@@ -530,13 +678,14 @@ onBeforeUnmount(() => {
           {{ t('orchestration.refresh') }}
         </button>
         <button
+          v-if="canWrite"
           type="button"
           class="px-4 py-2.5 rounded-xl border border-cyan-500/30 bg-cyan-500 text-slate-950 text-sm font-bold shadow-[0_0_24px_rgba(34,211,238,0.28)] disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
-          :disabled="isStarting || task?.status === 'running'"
-          @click="startOrchestration"
+          :disabled="startPending || task?.status === 'running'"
+          @click="requestStart"
         >
           <Play class="w-4 h-4" />
-          {{ isStarting ? t('orchestration.starting') : t('orchestration.start') }}
+          {{ startActionLabel() }}
         </button>
       </div>
     </div>
@@ -550,196 +699,344 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
-      <div class="grid grid-cols-1 xl:grid-cols-[1.15fr_0.85fr] gap-5">
-        <div class="rounded-2xl border border-white/10 bg-black/25 p-5">
-          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-slate-500">
-            <GitBranch class="w-4 h-4 text-cyan-300" />
-            {{ t('orchestration.summary') }}
-          </div>
-
-          <div class="mt-4 grid grid-cols-2 lg:grid-cols-4 gap-3">
-            <div class="rounded-2xl border border-white/8 bg-white/5 p-4">
-              <div class="text-xs text-slate-500 uppercase">{{ t('orchestration.runId') }}</div>
-              <div class="mt-2 text-lg font-semibold text-white font-mono">{{ shortRunId(runSummary?.run?.id) }}</div>
-            </div>
-            <div class="rounded-2xl border border-white/8 bg-white/5 p-4">
-              <div class="text-xs text-slate-500 uppercase">{{ t('orchestration.revision') }}</div>
-              <div class="mt-2 text-lg font-semibold text-white">{{ runSummary?.planner_revision || 0 }}</div>
-            </div>
-            <div class="rounded-2xl border border-white/8 bg-white/5 p-4">
-              <div class="text-xs text-slate-500 uppercase">{{ t('orchestration.activeSubtasks') }}</div>
-              <div class="mt-2 text-lg font-semibold text-white">{{ runSummary?.active_subtask_count || 0 }}</div>
-            </div>
-            <div class="rounded-2xl border border-white/8 bg-white/5 p-4">
-              <div class="text-xs text-slate-500 uppercase">{{ t('orchestration.completed') }}</div>
-              <div class="mt-2 text-lg font-semibold text-white">{{ runSummary?.completed_count || 0 }}</div>
-            </div>
-          </div>
+      <div v-if="stageIssueSummaries.length" class="rounded-2xl border border-rose-500/20 bg-rose-500/5 p-4">
+        <div class="flex items-center gap-2 text-rose-200">
+          <ShieldAlert class="w-4 h-4" />
+          <h3 class="text-sm font-bold uppercase tracking-[0.18em]">{{ t('orchestration.stageIssuesTitle') }}</h3>
         </div>
 
-        <div class="rounded-2xl border border-white/10 bg-black/25 p-5">
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-xs uppercase tracking-[0.22em] text-slate-500">{{ t('common.status') }}</div>
-            <span :class="['px-2.5 py-1 rounded-full border text-xs font-semibold uppercase', stateBadgeClass(diagnostics?.focus_status || runSummary?.run?.status)]">
-              {{ stageStateLabel(diagnostics?.focus_status || runSummary?.run?.status) }}
-            </span>
-          </div>
+        <div class="mt-3 grid gap-3">
+          <button
+            v-for="summary in stageIssueSummaries"
+            :key="summary.key"
+            type="button"
+            class="group rounded-xl border border-rose-500/20 bg-black/25 px-4 py-3 text-left transition-colors hover:bg-rose-500/10"
+            @click="openStageConsole(summary.view)"
+          >
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-sm font-semibold text-white">{{ summary.label }}</span>
+                  <span :class="['rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide', stageIssueStatusClass(summary.status)]">
+                    {{ summary.statusLabel }}
+                  </span>
+                </div>
+                <p class="mt-2 text-sm text-rose-100 break-words">{{ summary.message }}</p>
+                <div v-if="summary.updatedAt" class="mt-2 text-xs text-slate-500">{{ summary.updatedAt }}</div>
+              </div>
 
-          <div class="mt-4 space-y-3 text-sm">
-            <div class="flex items-center justify-between gap-4">
-              <span class="text-slate-400">{{ t('orchestration.plannerPending') }}</span>
-              <span class="text-white font-semibold">{{ diagnostics?.planner_pending ? t('orchestration.boolean.yes') : t('orchestration.boolean.no') }}</span>
+              <span class="inline-flex shrink-0 items-center gap-1 text-xs font-semibold text-rose-200 transition-colors group-hover:text-white">
+                {{ t('orchestration.viewStageLogs') }}
+                <ChevronRight class="w-3 h-3" />
+              </span>
             </div>
-            <div class="flex items-center justify-between gap-4">
-              <span class="text-slate-400">{{ t('orchestration.lastReplanReason') }}</span>
-              <span class="text-white text-right">{{ diagnostics?.last_replan_reason ? formatReplanReason(diagnostics.last_replan_reason, t) : '--' }}</span>
-            </div>
-            <div class="flex items-center justify-between gap-4">
-              <span class="text-slate-400">{{ t('orchestration.lastProgressAt') }}</span>
-              <span class="text-white text-right">{{ formatDate(diagnostics?.last_progress_at) }}</span>
-            </div>
-            <div class="flex items-center justify-between gap-4">
-              <span class="text-slate-400">{{ t('orchestration.silenceDuration') }}</span>
-              <span class="text-white text-right">{{ formatDuration(diagnostics?.silence_seconds) }}</span>
-            </div>
-          </div>
+          </button>
         </div>
       </div>
 
       <div class="rounded-2xl border border-white/10 bg-black/20 p-5">
-        <div class="flex items-center justify-between gap-4 flex-wrap">
+        <div class="flex items-start justify-between gap-4 flex-wrap">
           <div>
             <div class="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-slate-500">
               <Route class="w-4 h-4 text-cyan-300" />
-              {{ t('orchestration.overviewTitle') }}
+              {{ t('orchestration.flowTitle') }}
             </div>
-            <p class="mt-2 text-sm text-slate-400">{{ t('orchestration.overviewSubtitle') }}</p>
-            <p class="mt-2 text-xs text-slate-500">{{ t('orchestration.matrixRoleHint') }}</p>
+            <p class="mt-2 max-w-3xl text-sm text-slate-400">{{ t('orchestration.flowSubtitle') }}</p>
           </div>
 
-          <button
-            type="button"
-            class="px-3 py-1.5 rounded-full border text-xs font-semibold transition-colors bg-white/5 text-slate-300 border-white/10 hover:bg-white/10"
-            @click="resetStageFocus"
-          >
-            {{ t('orchestration.resetFocus') }}
-          </button>
+          <div class="flex flex-wrap items-center gap-2">
+            <span :class="['px-2.5 py-1 rounded-full border text-xs font-semibold uppercase', stateBadgeClass(diagnostics?.focus_status || runSummary?.run?.status)]">
+              {{ stageStateLabel(diagnostics?.focus_status || runSummary?.run?.status) }}
+            </span>
+            <button
+              type="button"
+              class="px-3 py-1.5 rounded-full border text-xs font-semibold transition-colors bg-white/5 text-slate-300 border-white/10 hover:bg-white/10"
+              @click="resetStageFocus"
+            >
+              {{ t('orchestration.resetFocus') }}
+            </button>
+          </div>
         </div>
 
-        <div class="mt-5 flex flex-wrap items-center gap-2">
-          <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{{ t('orchestration.parallelismLabel') }}</span>
-          <span
-            v-for="badge in parallelismBadges"
-            :key="badge.role"
-            class="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200"
-          >
-            <span>{{ badge.label }}</span>
-            <span class="text-cyan-200">{{ formatParallelism(badge.value) }}</span>
-          </span>
-          <span class="text-xs text-slate-500">
-            {{ t('orchestration.parallelismPlanner', { value: formatParallelism(diagnostics?.parallelism?.planner) }) }}
-          </span>
+        <div class="mt-5 grid grid-cols-2 md:grid-cols-5 gap-3">
+          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
+            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.runId') }}</div>
+            <div class="mt-1 font-mono text-sm font-semibold text-white">{{ shortRunId(runSummary?.run?.id) }}</div>
+          </div>
+          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
+            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.flow.activeStages') }}</div>
+            <div class="mt-1 text-sm font-semibold text-white">{{ orchestrationFlow.activeStageCount }}</div>
+          </div>
+          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
+            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.flow.readyUnits') }}</div>
+            <div class="mt-1 text-sm font-semibold text-white">{{ orchestrationFlow.queuedUnitCount }}</div>
+          </div>
+          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
+            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.flow.waitingUnits') }}</div>
+            <div class="mt-1 text-sm font-semibold text-white">{{ orchestrationFlow.waitingUnitCount }}</div>
+          </div>
+          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
+            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.completed') }}</div>
+            <div class="mt-1 text-sm font-semibold text-white">{{ orchestrationFlow.completedStageCount }} / {{ orchestrationFlow.totalStageCount }}</div>
+          </div>
         </div>
 
-        <div class="mt-6">
-          <button
-            type="button"
-            :class="[
-              'w-full rounded-3xl border px-5 py-5 text-left transition-all',
-              selectedStage === 'init'
-                ? 'border-cyan-400/40 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.18)]'
-                : 'border-white/10 bg-slate-950/45 hover:bg-white/5',
-            ]"
-            @click="chooseStage('init')"
-          >
-            <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-              <div class="min-w-0">
-                <div class="flex items-center gap-3 flex-wrap">
-                  <span class="rounded-full border border-cyan-500/25 bg-cyan-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-cyan-200">
-                    {{ t('orchestration.initGateLabel') }}
-                  </span>
-                  <span v-if="initStageCard.isCurrent" class="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
-                    {{ t('orchestration.currentStageChip') }}
-                  </span>
+        <div v-if="runScopeDetails" class="mt-4 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-slate-200">
+          <span class="font-semibold text-cyan-200">{{ t('orchestration.flow.rerunScope') }}</span>
+          <span class="ml-2 text-slate-400">{{ t('orchestration.flow.selectedStages') }}</span>
+          <span class="ml-1 text-white">{{ runScopeDetails.selected }}</span>
+          <span class="mx-2 text-slate-600">/</span>
+          <span class="text-slate-400">{{ t('orchestration.flow.carriedStages') }}</span>
+          <span class="ml-1 text-white">{{ runScopeDetails.carried }}</span>
+        </div>
+
+        <div class="mt-5 grid grid-cols-1 2xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.65fr)] gap-5">
+          <div class="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+            <button
+              type="button"
+              :class="flowNodeClass(orchestrationFlow.init)"
+              @click="chooseStage(orchestrationFlow.init.stage)"
+            >
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="rounded-full border border-cyan-500/25 bg-cyan-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">
+                      {{ t('orchestration.initGateLabel') }}
+                    </span>
+                    <span v-if="orchestrationFlow.init.isCurrent" class="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300">
+                      {{ t('orchestration.currentStageChip') }}
+                    </span>
+                  </div>
+                  <div class="mt-3 text-xl font-semibold text-white truncate">{{ orchestrationFlow.init.fullLabel }}</div>
                 </div>
-                <div class="mt-3 text-xl font-semibold text-white">{{ initStageCard.fullLabel }}</div>
-                <p class="mt-2 max-w-3xl text-sm text-slate-300">
-                  {{ initStageCard.status === 'completed' ? t('orchestration.initGateUnlocked') : t('orchestration.initGateLocked') }}
-                </p>
-              </div>
-
-              <div class="flex flex-wrap items-center gap-3">
-                <span :class="['px-2.5 py-1 rounded-full border text-xs font-semibold uppercase', stateBadgeClass(initStageCard.status)]">
-                  {{ stageStateLabel(initStageCard.status) }}
+                <span :class="['shrink-0 rounded-full border px-2.5 py-1 text-xs font-semibold uppercase', stateBadgeClass(orchestrationFlow.init.status)]">
+                  {{ stageStateLabel(orchestrationFlow.init.status) }}
                 </span>
-                <div class="rounded-2xl border border-white/10 bg-black/25 px-4 py-3 text-xs text-slate-300">
-                  {{ t('orchestration.provisional') }} {{ initStageCard.provisionalCount }}
-                  <span class="mx-2 text-slate-600">/</span>
-                  {{ t('orchestration.validated') }} {{ initStageCard.validatedCount }}
+              </div>
+
+              <div class="mt-4 h-1.5 overflow-hidden rounded-full bg-white/10">
+                <div class="h-full rounded-full bg-cyan-300 transition-all" :style="flowProgressStyle(orchestrationFlow.init)" />
+              </div>
+
+              <div class="mt-4 grid grid-cols-4 gap-2 text-xs">
+                <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                  <div class="text-slate-500">{{ t('orchestration.flow.running') }}</div>
+                  <div class="mt-1 font-semibold text-white">{{ orchestrationFlow.init.activeCount }}</div>
+                </div>
+                <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                  <div class="text-slate-500">{{ t('orchestration.flow.ready') }}</div>
+                  <div class="mt-1 font-semibold text-white">{{ orchestrationFlow.init.readyCount }}</div>
+                </div>
+                <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                  <div class="text-slate-500">{{ t('orchestration.flow.waiting') }}</div>
+                  <div class="mt-1 font-semibold text-white">{{ orchestrationFlow.init.waitingCount }}</div>
+                </div>
+                <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                  <div class="text-slate-500">{{ t('orchestration.flow.done') }}</div>
+                  <div class="mt-1 font-semibold text-white">{{ orchestrationFlow.init.completedCount }} / {{ orchestrationFlow.init.subtaskCount }}</div>
                 </div>
               </div>
-            </div>
-          </button>
+            </button>
 
-          <div class="flex justify-center py-3">
-            <div class="h-10 w-px bg-gradient-to-b from-cyan-400/60 via-cyan-400/15 to-transparent" />
+            <div class="flex justify-center py-4">
+              <div :class="['h-12 w-px bg-gradient-to-b', flowConnectorClass()]" />
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+              <button
+                v-for="node in orchestrationFlow.auditStages"
+                :key="node.stage"
+                type="button"
+                :class="flowNodeClass(node)"
+                @click="chooseStage(node.stage)"
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="text-base font-semibold text-white">{{ node.label }}</span>
+                      <span v-if="node.isCurrent" class="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300">
+                        {{ t('orchestration.currentStageChip') }}
+                      </span>
+                      <span v-if="node.locked" class="rounded-full border border-slate-600/50 bg-slate-800/50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                        {{ t('orchestration.flow.locked') }}
+                      </span>
+                    </div>
+                  </div>
+                  <span :class="['shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase', stateBadgeClass(node.status)]">
+                    {{ stageStateLabel(node.status) }}
+                  </span>
+                </div>
+
+                <div class="mt-4 h-1.5 overflow-hidden rounded-full bg-white/10">
+                  <div class="h-full rounded-full bg-cyan-300 transition-all" :style="flowProgressStyle(node)" />
+                </div>
+
+                <div class="mt-4 grid grid-cols-4 gap-2 text-xs">
+                  <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                    <div class="text-slate-500">{{ t('orchestration.flow.running') }}</div>
+                    <div class="mt-1 font-semibold text-white">{{ node.activeCount }}</div>
+                  </div>
+                  <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                    <div class="text-slate-500">{{ t('orchestration.flow.ready') }}</div>
+                    <div class="mt-1 font-semibold text-white">{{ node.readyCount }}</div>
+                  </div>
+                  <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                    <div class="text-slate-500">{{ t('orchestration.flow.waiting') }}</div>
+                    <div class="mt-1 font-semibold text-white">{{ node.waitingCount }}</div>
+                  </div>
+                  <div class="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                    <div class="text-slate-500">{{ t('orchestration.flow.done') }}</div>
+                    <div class="mt-1 font-semibold text-white">{{ node.completedCount }} / {{ node.subtaskCount }}</div>
+                  </div>
+                </div>
+              </button>
+            </div>
           </div>
 
-          <div class="rounded-3xl border border-white/10 bg-slate-950/35">
-            <div class="flex items-start justify-between gap-4 border-b border-white/10 px-5 py-4 flex-wrap">
-              <div>
-                <div class="text-sm font-semibold text-white">{{ t('orchestration.matrixTitle') }}</div>
-                <div class="mt-1 text-xs text-slate-500">{{ t('orchestration.matrixSubtitle') }}</div>
+          <div class="space-y-4">
+            <div class="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-sm font-semibold text-white">{{ t('orchestration.queue.activeNow') }}</div>
+                <span class="rounded-full border border-cyan-500/25 bg-cyan-500/10 px-2.5 py-1 text-xs font-semibold text-cyan-200">
+                  {{ executionQueues.totals.active }}
+                </span>
               </div>
-              <div class="text-xs text-slate-500">{{ t('orchestration.matrixFanoutHint') }}</div>
-            </div>
 
-            <div class="overflow-x-auto">
-              <div class="min-w-[840px]">
-                <div class="grid grid-cols-[1.2fr_repeat(5,minmax(0,0.78fr))] gap-3 px-5 py-3 text-[11px] uppercase tracking-[0.18em] text-slate-500">
-                  <div>{{ t('orchestration.matrix.columns.stage') }}</div>
-                  <div>{{ t('orchestration.matrix.columns.overall') }}</div>
-                  <div>{{ t('orchestration.matrix.columns.worker') }}</div>
-                  <div>{{ t('orchestration.matrix.columns.integrator') }}</div>
-                  <div>{{ t('orchestration.matrix.columns.validator') }}</div>
-                  <div>{{ t('orchestration.matrix.columns.persistence') }}</div>
+              <div class="mt-3 space-y-2">
+                <div
+                  v-for="unit in activeExecutionUnits"
+                  :key="unit.id"
+                  :class="['rounded-2xl border px-3 py-3', queueUnitClass(unit)]"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <div class="text-sm font-semibold text-white truncate">{{ queueUnitPrimary(unit) }}</div>
+                      <div class="mt-1 text-xs text-slate-400 truncate">{{ queueUnitSecondary(unit) }}</div>
+                    </div>
+                    <span :class="['shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase', queueUnitBadgeClass(unit)]">
+                      {{ queueUnitStatusLabel(unit) }}
+                    </span>
+                  </div>
                 </div>
 
-                <div class="space-y-2 px-3 pb-3">
-                  <button
-                    v-for="row in stageMatrixRows"
-                    :key="row.stage"
-                    type="button"
-                    class="grid w-full grid-cols-[1.2fr_repeat(5,minmax(0,0.78fr))] gap-3 rounded-2xl border px-3 py-3 text-left transition-all"
-                    :class="matrixRowClass(row)"
-                    @click="chooseStage(row.stage)"
-                  >
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-3 flex-wrap">
-                        <div class="text-sm font-semibold text-white">{{ row.label }}</div>
-                        <span v-if="row.isCurrent" class="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">
-                          {{ t('orchestration.currentStageChip') }}
+                <div v-if="!activeExecutionUnits.length" class="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-6 text-sm text-slate-400">
+                  {{ t('orchestration.queue.emptyActive') }}
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-sm font-semibold text-white">{{ t('orchestration.queue.readyQueue') }}</div>
+                <span class="rounded-full border border-blue-500/25 bg-blue-500/10 px-2.5 py-1 text-xs font-semibold text-blue-200">
+                  {{ executionQueues.totals.ready }}
+                </span>
+              </div>
+
+              <div class="mt-3 space-y-2 max-h-[360px] overflow-auto pr-1">
+                <div
+                  v-for="unit in readyExecutionUnits"
+                  :key="unit.id"
+                  :class="['rounded-2xl border px-3 py-3', queueUnitClass(unit)]"
+                >
+                  <div class="flex items-start gap-3">
+                    <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-blue-500/25 bg-blue-500/10 text-xs font-bold text-blue-200">
+                      {{ unit.position }}
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center justify-between gap-3">
+                        <div class="text-sm font-semibold text-white truncate">{{ queueUnitPrimary(unit) }}</div>
+                        <span :class="['shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase', queueUnitBadgeClass(unit)]">
+                          {{ queueUnitStatusLabel(unit) }}
                         </span>
                       </div>
-                      <div class="mt-1 text-xs text-slate-500">{{ row.fullLabel }}</div>
+                      <div class="mt-1 text-xs text-slate-400 truncate">{{ queueUnitSecondary(unit) }}</div>
                     </div>
+                  </div>
+                </div>
 
-                    <div class="flex items-center">
-                      <span :class="['inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold uppercase', stateBadgeClass(row.status)]">
-                        {{ stageStateLabel(row.status) }}
-                      </span>
-                    </div>
+                <div v-if="!readyExecutionUnits.length" class="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-6 text-sm text-slate-400">
+                  {{ t('orchestration.queue.emptyReady') }}
+                </div>
+              </div>
+            </div>
 
-                    <div
-                      v-for="cell in row.roleCells"
-                      :key="`${row.stage}-${cell.role}`"
-                      class="flex items-center"
-                    >
-                      <span :class="['inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold uppercase', roleBadgeClass(cell.status)]">
-                        {{ roleStateLabel(cell.status) }}
-                      </span>
+            <div class="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-sm font-semibold text-white">{{ t('orchestration.queue.waitingQueue') }}</div>
+                <span class="rounded-full border border-slate-500/25 bg-slate-500/10 px-2.5 py-1 text-xs font-semibold text-slate-200">
+                  {{ executionQueues.totals.waiting }}
+                </span>
+              </div>
+
+              <div class="mt-3 space-y-2 max-h-[300px] overflow-auto pr-1">
+                <div
+                  v-for="unit in waitingExecutionUnits"
+                  :key="unit.id"
+                  :class="['rounded-2xl border px-3 py-3', queueUnitClass(unit)]"
+                >
+                  <div class="flex items-start gap-3">
+                    <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-slate-500/25 bg-slate-500/10 text-xs font-bold text-slate-200">
+                      {{ unit.position }}
                     </div>
-                  </button>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center justify-between gap-3">
+                        <div class="text-sm font-semibold text-white truncate">{{ queueUnitPrimary(unit) }}</div>
+                        <span :class="['shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase', queueUnitBadgeClass(unit)]">
+                          {{ queueUnitStatusLabel(unit) }}
+                        </span>
+                      </div>
+                      <div class="mt-1 text-xs text-slate-400 truncate">{{ queueUnitSecondary(unit) }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="!waitingExecutionUnits.length" class="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-6 text-sm text-slate-400">
+                  {{ t('orchestration.queue.emptyWaiting') }}
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-sm font-semibold text-white">{{ t('orchestration.queue.blockedQueue') }}</div>
+                <span class="rounded-full border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-xs font-semibold text-rose-200">
+                  {{ executionQueues.totals.blocked }}
+                </span>
+              </div>
+              <div class="mt-3 space-y-2 max-h-[280px] overflow-auto pr-1">
+                <div
+                  v-for="unit in blockedExecutionUnits"
+                  :key="unit.id"
+                  :class="['rounded-2xl border px-3 py-3', queueUnitClass(unit)]"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <div class="text-sm font-semibold text-white truncate">{{ queueUnitPrimary(unit) }}</div>
+                      <div class="mt-1 max-h-10 overflow-hidden text-xs text-rose-100 break-words">{{ unit.errorMessage || unit.blockedReason || t('orchestration.queue.noBlockedReason') }}</div>
+                    </div>
+                    <span :class="['shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase', queueUnitBadgeClass(unit)]">
+                      {{ queueUnitStatusLabel(unit) }}
+                    </span>
+                  </div>
+                </div>
+
+                <div v-if="!blockedExecutionUnits.length" class="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-6 text-sm text-slate-400">
+                  {{ t('orchestration.queue.emptyBlocked') }}
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <div class="text-sm font-semibold text-white">{{ t('orchestration.queue.roleLoads') }}</div>
+              <div class="mt-3 grid grid-cols-2 gap-2">
+                <div
+                  v-for="roleQueue in executionQueues.roles"
+                  :key="roleQueue.role"
+                  class="rounded-2xl border border-white/10 bg-black/25 px-3 py-3"
+                >
+                  <div class="text-xs text-slate-500">{{ roleQueue.label }}</div>
+                  <div class="mt-1 text-sm font-semibold text-white">{{ roleQueueLoadLabel(roleQueue) }}</div>
                 </div>
               </div>
             </div>
@@ -768,10 +1065,18 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+              <div v-if="diagnostics.stalled" class="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-4 md:col-span-2">
+                <div class="text-xs uppercase tracking-[0.18em] text-amber-200">{{ t('orchestration.longNoProgress') }}</div>
+                <div class="mt-2 text-white font-semibold">{{ formatDuration(diagnostics.focus_silence_seconds) }}</div>
+                <div class="mt-1 text-xs text-amber-100">
+                  {{ t('orchestration.stallThreshold', { value: formatDuration(diagnostics.stall_threshold_seconds) }) }}
+                </div>
+              </div>
               <div class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
                 <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.focusSubtask') }}</div>
                 <div class="mt-2 text-white font-semibold">{{ diagnostics.focus_subtask_title || '--' }}</div>
                 <div class="mt-1 text-xs text-slate-500 font-mono">{{ diagnostics.focus_subtask_id || '--' }}</div>
+                <div v-if="diagnostics.active_agent_run_id" class="mt-1 text-xs text-slate-500 font-mono">{{ diagnostics.active_agent_run_id }}</div>
               </div>
               <div class="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
                 <div class="text-xs uppercase tracking-[0.18em] text-slate-500">{{ t('orchestration.focusReason') }}</div>

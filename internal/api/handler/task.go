@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"codescan/internal/database"
 	"codescan/internal/model"
 	"codescan/internal/service/orchestration"
+	orgsvc "codescan/internal/service/organization"
 	"codescan/internal/service/scanner"
 	summarysvc "codescan/internal/service/summary"
 	"codescan/internal/utils"
@@ -29,26 +31,6 @@ type taskDetailResponse struct {
 }
 
 var (
-	launchTaskOrchestration = func(taskID string) error {
-		_, err := orchestration.DefaultManager().Start(taskID)
-		return err
-	}
-	launchLegacyInitScan = func(task *model.Task) {
-		scanner.RunAIScan(task, "init")
-	}
-	loadTaskStatus = func(taskID string) (string, error) {
-		var task model.Task
-		if err := database.DB.Select("status").First(&task, "id = ?", taskID).Error; err != nil {
-			return "", err
-		}
-		return task.Status, nil
-	}
-	persistTask = func(task *model.Task) error {
-		return database.DB.Save(task).Error
-	}
-	persistTaskStatus = func(taskID, status string) error {
-		return database.DB.Model(&model.Task{}).Where("id = ?", taskID).Update("status", status).Error
-	}
 	loadTaskWithStagesForControl = func(taskID string) (model.Task, error) {
 		var task model.Task
 		err := database.DB.Preload("Stages").First(&task, "id = ?", taskID).Error
@@ -77,46 +59,15 @@ var (
 	resumeLegacyTaskScan = func(task *model.Task) (string, error) {
 		return scanner.ResumeAIScan(task)
 	}
-	taskLogClock = time.Now
-	newTaskID    = utils.NewOpaqueID
+	repairTaskJSON = scanner.RepairJSON
+	newTaskID      = utils.NewOpaqueID
 )
 
-func formatTaskLogEntry(message string) string {
-	return fmt.Sprintf("[%s] %s", taskLogClock().Format("15:04:05"), message)
-}
-
-func autoStartUploadedTask(task *model.Task) error {
-	if !config.Orchestration.Enabled {
-		task.Status = "running"
-		if err := persistTaskStatus(task.ID, "running"); err != nil {
-			return err
-		}
-		launchLegacyInitScan(task)
-		return nil
-	}
-
-	if err := launchTaskOrchestration(task.ID); err == nil {
-		task.Status = "running"
-		return nil
-	} else {
-		status, statusErr := loadTaskStatus(task.ID)
-		if statusErr == nil && strings.EqualFold(status, "running") {
-			task.Status = "running"
-			return nil
-		}
-
-		message := fmt.Sprintf("Automatic orchestration failed to start: %v", err)
-		log.Printf("warning: task %s auto-start failed: %v", task.ID, err)
-
-		task.Status = "failed"
-		task.Result = message
-		task.Logs = append(task.Logs, formatTaskLogEntry(message))
-		return persistTask(task)
-	}
-}
-
 func GetTasksHandler(c *gin.Context) {
-	list, err := loadTasksForSummary()
+	list, err := loadTasksForSummary(c)
+	if errors.Is(err, errResponseWritten) {
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load task summaries"})
 		return
@@ -127,15 +78,16 @@ func GetTasksHandler(c *gin.Context) {
 func GetTaskDetailHandler(c *gin.Context) {
 	id := c.Param("id")
 
-	var task model.Task
-	if err := database.DB.
-		Preload("Stages", func(db *gorm.DB) *gorm.DB { return db.Order("created_at asc") }).
-		First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	task, ok := loadReadableTask(c, id, func(db *gorm.DB) *gorm.DB {
+		return db.
+			Preload("Organization").
+			Preload("Stages", func(db *gorm.DB) *gorm.DB { return db.Order("created_at asc") })
+	})
+	if !ok {
 		return
 	}
 
-	summary, err := orchestration.DefaultManager().Summary(task.ID)
+	summary, err := loadTaskOrchestrationSummary(task.ID)
 	if err != nil {
 		log.Printf("warning: failed to build orchestration summary for task %s: %v", task.ID, err)
 	}
@@ -146,17 +98,26 @@ func GetTaskDetailHandler(c *gin.Context) {
 	})
 }
 
-func loadTasksForSummary() ([]model.Task, error) {
+func loadTasksForSummary(c *gin.Context) ([]model.Task, error) {
+	query, ok := scopedReadableTasksQuery(c, database.DB.Model(&model.Task{}))
+	if !ok {
+		return nil, errResponseWritten
+	}
+
 	var list []model.Task
-	err := database.DB.
-		Model(&model.Task{}).
-		Select("id", "name", "remark", "status", "created_at", "result", "output_json").
+	err := query.
+		Select("id", "name", "remark", "status", "organization_id", "created_at", "result", "output_json").
 		Order("created_at desc").
-		Preload("Stages", func(db *gorm.DB) *gorm.DB {
-			return db.Select("id", "task_id", "name", "status", "result", "output_json", "meta", "created_at", "updated_at")
-		}).
+		Preload("Organization").
+		Preload("Stages", func(db *gorm.DB) *gorm.DB { return db.Order("created_at asc") }).
 		Find(&list).Error
-	return list, err
+	if err != nil {
+		return nil, err
+	}
+	if !attachTaskPermissions(c, list) {
+		return nil, errResponseWritten
+	}
+	return list, nil
 }
 
 func isSupportedStageName(stageName string) bool {
@@ -176,6 +137,11 @@ func loadStructuredStage(taskID, stageName string) (*model.TaskStage, []map[stri
 }
 
 func UploadHandler(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		return
+	}
+
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
@@ -185,8 +151,23 @@ func UploadHandler(c *gin.Context) {
 	name := c.PostForm("name")
 	remark := c.PostForm("remark")
 
-	if file.Size > utils.MaxFileSize {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File exceeds 30MB limit"})
+	if file.Size > utils.MaxUploadFileSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("File exceeds %dMB limit", utils.MaxUploadFileSize/(1024*1024))})
+		return
+	}
+
+	organizationID, err := strconv.ParseUint(strings.TrimSpace(c.PostForm("organization_id")), 10, 64)
+	if err != nil || organizationID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization_id is required"})
+		return
+	}
+	canWriteOrg, err := orgsvc.CanWriteOrganization(database.DB, user, uint(organizationID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to inspect organization permissions"})
+		return
+	}
+	if !canWriteOrg {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
 
@@ -211,14 +192,15 @@ func UploadHandler(c *gin.Context) {
 	os.Remove(zipPath)
 
 	task := &model.Task{
-		ID:         id,
-		Name:       name,
-		Remark:     remark,
-		Status:     "pending",
-		CreatedAt:  time.Now(),
-		BasePath:   projectPath,
-		Logs:       []string{},
-		OutputJSON: json.RawMessage([]byte("{}")),
+		ID:             id,
+		Name:           name,
+		Remark:         remark,
+		Status:         "pending",
+		OrganizationID: uintPtr(uint(organizationID)),
+		CreatedAt:      time.Now(),
+		BasePath:       projectPath,
+		Logs:           []string{},
+		OutputJSON:     json.RawMessage([]byte("{}")),
 	}
 
 	if err := database.DB.Create(task).Error; err != nil {
@@ -226,13 +208,12 @@ func UploadHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
 		return
 	}
-	if err := autoStartUploadedTask(task); err != nil {
-		log.Printf("warning: task %s created but failed to initialize execution: %v", task.ID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize task"})
-		return
-	}
 
 	c.JSON(http.StatusOK, task)
+}
+
+func uintPtr(value uint) *uint {
+	return &value
 }
 
 var (
@@ -367,6 +348,9 @@ func PauseTaskHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
 		return
 	}
+	if !requireTaskWrite(c, &task) {
+		return
+	}
 
 	switch strings.ToLower(strings.TrimSpace(task.Status)) {
 	case "running":
@@ -404,6 +388,9 @@ func ResumeTaskHandler(c *gin.Context) {
 	task, err := loadTaskForControl(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+	if !requireTaskWrite(c, &task) {
 		return
 	}
 
@@ -458,9 +445,8 @@ func RunStageHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported stage"})
 		return
 	}
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	task, ok := loadWritableTask(c, id, nil)
+	if !ok {
 		return
 	}
 	if task.Status == "running" {
@@ -484,9 +470,8 @@ func GapCheckStageHandler(c *gin.Context) {
 		return
 	}
 
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	task, ok := loadWritableTask(c, id, nil)
+	if !ok {
 		return
 	}
 	if task.Status == "running" {
@@ -534,9 +519,8 @@ func RevalidateStageHandler(c *gin.Context) {
 		return
 	}
 
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	task, ok := loadWritableTask(c, id, nil)
+	if !ok {
 		return
 	}
 	if task.Status == "running" {
@@ -571,19 +555,23 @@ func RevalidateStageHandler(c *gin.Context) {
 
 func RepairJSONHandler(c *gin.Context) {
 	id := c.Param("id")
-	stageName := c.Query("stage")
-
-	var task model.Task
-	if err := database.DB.First(&task, "id = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+	stageName, ok := scanner.NormalizeRepairStage(c.Query("stage"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Unsupported repair stage: %s", c.Query("stage"))})
 		return
 	}
 
-	var rawResult string
+	task, ok := loadWritableTask(c, id, nil)
+	if !ok {
+		return
+	}
+
+	var repairSource string
+	var oldOutput json.RawMessage
 	var target interface{}
 
-	if stageName == "" || stageName == "init" {
-		rawResult = task.Result
+	if stageName == "init" {
+		oldOutput = task.OutputJSON
 		target = &task
 	} else {
 		var stage model.TaskStage
@@ -591,47 +579,91 @@ func RepairJSONHandler(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Stage not found"})
 			return
 		}
-		rawResult = stage.Result
+		oldOutput = stage.OutputJSON
 		target = &stage
 	}
 
-	if rawResult == "" {
-		var logs []string
-		switch t := target.(type) {
-		case *model.Task:
-			logs = t.Logs
-		case *model.TaskStage:
-			logs = t.Logs
-		}
-
-		for i := len(logs) - 1; i >= 0; i-- {
-			logEntry := logs[i]
-			if idx := strings.Index(logEntry, "] AI: "); idx != -1 {
-				rawResult = logEntry[idx+6:]
-				break
-			}
-		}
-	}
-
-	if rawResult == "" {
+	repairSource = repairableRawResult(target)
+	if repairSource == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No result to repair. Please re-run the scan."})
 		return
 	}
 
-	repaired, err := scanner.RepairJSON(rawResult, stageName)
+	repaired, err := repairTaskJSON(repairSource, stageName)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to repair JSON: " + err.Error()})
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "Failed to repair JSON: " + err.Error(),
+			"stage":       stageName,
+			"output_json": oldOutput,
+		})
 		return
 	}
+	items, repairedJSON, err := scanner.ParseValidatedRepairJSON(repaired, stageName)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "Failed to repair JSON: " + err.Error(),
+			"stage":       stageName,
+			"output_json": oldOutput,
+		})
+		return
+	}
+	repaired = string(repairedJSON)
 
 	switch t := target.(type) {
 	case *model.Task:
 		t.OutputJSON = json.RawMessage(repaired)
-		database.DB.Save(t)
+		if err := database.DB.Save(t).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save repaired JSON"})
+			return
+		}
 	case *model.TaskStage:
 		t.OutputJSON = json.RawMessage(repaired)
-		database.DB.Save(t)
+		if err := database.DB.Save(t).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save repaired JSON"})
+			return
+		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "repaired", "output_json": json.RawMessage(repaired)})
+	c.JSON(http.StatusOK, gin.H{"status": "repaired", "stage": stageName, "output_json": json.RawMessage(repaired), "count": len(items)})
+}
+
+func repairableRawResult(target interface{}) string {
+	var result string
+	var logs []string
+	switch t := target.(type) {
+	case *model.Task:
+		result = t.Result
+		logs = t.Logs
+	case *model.TaskStage:
+		result = t.Result
+		logs = t.Logs
+	default:
+		return ""
+	}
+
+	if canUseStoredResultForRepair(result) {
+		return strings.TrimSpace(result)
+	}
+	return latestAIResultFromLogs(logs)
+}
+
+func canUseStoredResultForRepair(result string) bool {
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "Result processing error:") {
+		return false
+	}
+	return strings.Contains(trimmed, "[") || strings.Contains(trimmed, "{") || strings.Contains(trimmed, "```")
+}
+
+func latestAIResultFromLogs(logs []string) string {
+	for i := len(logs) - 1; i >= 0; i-- {
+		logEntry := logs[i]
+		if idx := strings.Index(logEntry, "] AI: "); idx != -1 {
+			return strings.TrimSpace(logEntry[idx+6:])
+		}
+	}
+	return ""
 }

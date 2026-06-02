@@ -137,16 +137,25 @@ func configSchema() configSchemaNode {
 					"api_key":  leafSchema(),
 					"base_url": leafSchema(),
 					"model":    leafSchema(),
+					"thinking": {
+						children: map[string]configSchemaNode{
+							"enabled":               leafSchema(),
+							"effort":                leafSchema(),
+							"max_completion_tokens": leafSchema(),
+							"apply_to_auxiliary":    leafSchema(),
+						},
+					},
 				},
 			},
 			"scanner_config": {
 				children: map[string]configSchemaNode{
 					"context_compression": {
 						children: map[string]configSchemaNode{
-							"soft_limit_tokens": leafSchema(),
-							"hard_limit_tokens": leafSchema(),
+							"context_window_tokens": leafSchema(),
 						},
 						removed: map[string]string{
+							"soft_limit_tokens":         "replace it with scanner_config.context_compression.context_window_tokens",
+							"hard_limit_tokens":         "replace it with scanner_config.context_compression.context_window_tokens",
 							"soft_limit_bytes":          "delete it from the config file; byte fallback threshold is now built in",
 							"hard_limit_bytes":          "delete it from the config file; byte fallback threshold is now built in",
 							"summary_window_messages":   "delete it from the config file; summary window tuning is now built in",

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -90,6 +91,18 @@ func newAIClient() *openai.Client {
 	return openai.NewClientWithConfig(cfg)
 }
 
+func resultWithProcessingError(rawOutput string, message string) string {
+	rawOutput = strings.TrimSpace(rawOutput)
+	message = strings.TrimSpace(message)
+	if rawOutput == "" {
+		return message
+	}
+	if message == "" {
+		return rawOutput
+	}
+	return rawOutput + "\n\n[" + message + "]"
+}
+
 func extractJSON(input string) string {
 	input = strings.TrimSpace(input)
 	if json.Valid([]byte(input)) {
@@ -148,7 +161,7 @@ func hasTokenUsage(usage openai.Usage) bool {
 		usage.CompletionTokensDetails != nil
 }
 
-func formatTokenUsageLog(usage openai.Usage, softLimitTokens, hardLimitTokens int) string {
+func formatTokenUsageLog(usage openai.Usage, microLimitTokens, fullLimitTokens, hardLimitTokens int) string {
 	parts := []string{
 		fmt.Sprintf("prompt=%d", usage.PromptTokens),
 		fmt.Sprintf("completion=%d", usage.CompletionTokens),
@@ -160,13 +173,15 @@ func formatTokenUsageLog(usage openai.Usage, softLimitTokens, hardLimitTokens in
 	if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
 		parts = append(parts, fmt.Sprintf("reasoning=%d", usage.CompletionTokensDetails.ReasoningTokens))
 	}
-	if softLimitTokens > 0 {
+	if microLimitTokens > 0 {
 		pressure := "safe"
 		switch {
 		case hardLimitTokens > 0 && usage.PromptTokens >= hardLimitTokens:
 			pressure = "hard"
-		case usage.PromptTokens >= softLimitTokens:
-			pressure = "soft"
+		case fullLimitTokens > 0 && usage.PromptTokens >= fullLimitTokens:
+			pressure = "full"
+		case usage.PromptTokens >= microLimitTokens:
+			pressure = "micro"
 		}
 		parts = append(parts, "pressure="+pressure)
 	}
@@ -181,8 +196,24 @@ func calculateContextBytes(messages []openai.ChatCompletionMessage) int {
 	return total
 }
 
+func estimateContextTokens(messages []openai.ChatCompletionMessage) int {
+	bytes := calculateContextBytes(messages)
+	if bytes == 0 {
+		return 0
+	}
+	return (bytes+3)/4 + len(messages)*4
+}
+
+func chatMessagesFromEntries(entries []chatEntry) []openai.ChatCompletionMessage {
+	messages := make([]openai.ChatCompletionMessage, 0, len(entries))
+	for _, entry := range entries {
+		messages = append(messages, entry.Chat)
+	}
+	return messages
+}
+
 func messageContextBytes(msg openai.ChatCompletionMessage) int {
-	total := len(msg.Content)
+	total := len(msg.Content) + len(msg.ReasoningContent)
 	for _, toolCall := range msg.ToolCalls {
 		total += len(toolCall.Function.Name)
 		total += len(toolCall.Function.Arguments)
@@ -424,11 +455,43 @@ type chatCompletionRetryHooks struct {
 
 var errEmptyChatCompletionStream = errors.New("chat completion stream ended without any choice data")
 
+type toolCallNormalizationStats struct {
+	droppedInvalidToolCalls int
+	generatedToolCallIDs    int
+}
+
+func (s toolCallNormalizationStats) changed() bool {
+	return s.droppedInvalidToolCalls > 0 || s.generatedToolCallIDs > 0
+}
+
+func (s *toolCallNormalizationStats) add(other toolCallNormalizationStats) {
+	if s == nil {
+		return
+	}
+	s.droppedInvalidToolCalls += other.droppedInvalidToolCalls
+	s.generatedToolCallIDs += other.generatedToolCallIDs
+}
+
+func (s toolCallNormalizationStats) summary(context string) string {
+	parts := []string{}
+	if s.droppedInvalidToolCalls > 0 {
+		parts = append(parts, fmt.Sprintf("dropped %d invalid tool calls", s.droppedInvalidToolCalls))
+	}
+	if s.generatedToolCallIDs > 0 {
+		parts = append(parts, fmt.Sprintf("generated %d local tool_call ids", s.generatedToolCallIDs))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s: %s.", context, strings.Join(parts, "; "))
+}
+
 type chatCompletionStreamAccumulator struct {
 	response          openai.ChatCompletionResponse
 	choice            openai.ChatCompletionChoice
 	choiceInitialized bool
 	receivedChunk     bool
+	toolCallSlots     map[int]int
 }
 
 func newChatCompletionStreamAccumulator(model string) *chatCompletionStreamAccumulator {
@@ -436,6 +499,7 @@ func newChatCompletionStreamAccumulator(model string) *chatCompletionStreamAccum
 		response: openai.ChatCompletionResponse{
 			Model: strings.TrimSpace(model),
 		},
+		toolCallSlots: map[int]int{},
 	}
 }
 
@@ -497,7 +561,7 @@ func (a *chatCompletionStreamAccumulator) addChunk(chunk openai.ChatCompletionSt
 		}
 	}
 	if len(choice.Delta.ToolCalls) > 0 {
-		a.choice.Message.ToolCalls = mergeChatCompletionToolCalls(a.choice.Message.ToolCalls, choice.Delta.ToolCalls)
+		a.choice.Message.ToolCalls = mergeChatCompletionToolCalls(a.choice.Message.ToolCalls, choice.Delta.ToolCalls, a.toolCallSlots)
 	}
 	if choice.FinishReason != "" {
 		a.choice.FinishReason = choice.FinishReason
@@ -522,11 +586,22 @@ func (a *chatCompletionStreamAccumulator) finalize() (openai.ChatCompletionRespo
 	return a.response, nil
 }
 
-func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.ToolCall) []openai.ToolCall {
+func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.ToolCall, slotByIndex map[int]int) []openai.ToolCall {
 	for _, delta := range deltas {
 		idx := len(existing)
 		if delta.Index != nil && *delta.Index >= 0 {
-			idx = *delta.Index
+			if mapped, ok := slotByIndex[*delta.Index]; ok {
+				idx = mapped
+			} else {
+				idx = len(existing)
+				if slotByIndex != nil {
+					slotByIndex[*delta.Index] = idx
+				}
+			}
+		} else if delta.ID != "" {
+			if mapped := findToolCallIndexByID(existing, delta.ID); mapped >= 0 {
+				idx = mapped
+			}
 		}
 		for len(existing) <= idx {
 			existing = append(existing, openai.ToolCall{
@@ -535,6 +610,7 @@ func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.To
 		}
 
 		target := &existing[idx]
+		target.Index = nil
 		if delta.ID != "" {
 			target.ID = delta.ID
 		}
@@ -552,6 +628,78 @@ func mergeChatCompletionToolCalls(existing []openai.ToolCall, deltas []openai.To
 	}
 
 	return existing
+}
+
+func findToolCallIndexByID(toolCalls []openai.ToolCall, id string) int {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return -1
+	}
+	for idx, toolCall := range toolCalls {
+		if strings.TrimSpace(toolCall.ID) == id {
+			return idx
+		}
+	}
+	return -1
+}
+
+func normalizeToolCallMessage(msg openai.ChatCompletionMessage) (openai.ChatCompletionMessage, toolCallNormalizationStats) {
+	if len(msg.ToolCalls) == 0 {
+		return msg, toolCallNormalizationStats{}
+	}
+
+	normalized := msg
+	toolCalls, stats := normalizeToolCalls(msg.ToolCalls)
+	normalized.ToolCalls = toolCalls
+	return normalized, stats
+}
+
+func normalizeToolCalls(toolCalls []openai.ToolCall) ([]openai.ToolCall, toolCallNormalizationStats) {
+	if len(toolCalls) == 0 {
+		return nil, toolCallNormalizationStats{}
+	}
+
+	normalized := make([]openai.ToolCall, 0, len(toolCalls))
+	stats := toolCallNormalizationStats{}
+	seenIDs := map[string]struct{}{}
+	nextGeneratedID := 1
+
+	nextToolCallID := func() string {
+		for {
+			candidate := fmt.Sprintf("generated-call-%d", nextGeneratedID)
+			nextGeneratedID++
+			if _, exists := seenIDs[candidate]; !exists {
+				return candidate
+			}
+		}
+	}
+
+	for _, toolCall := range toolCalls {
+		name := strings.TrimSpace(toolCall.Function.Name)
+		if name == "" {
+			stats.droppedInvalidToolCalls++
+			continue
+		}
+
+		normalizedCall := toolCall
+		normalizedCall.Index = nil
+		normalizedCall.Type = openai.ToolTypeFunction
+		normalizedCall.Function.Name = name
+
+		id := strings.TrimSpace(normalizedCall.ID)
+		if id == "" {
+			id = nextToolCallID()
+			stats.generatedToolCallIDs++
+		} else if _, exists := seenIDs[id]; exists {
+			id = nextToolCallID()
+			stats.generatedToolCallIDs++
+		}
+		normalizedCall.ID = id
+		seenIDs[id] = struct{}{}
+		normalized = append(normalized, normalizedCall)
+	}
+
+	return normalized, stats
 }
 
 func createChatCompletion(ctx context.Context, client *openai.Client, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, bool, error) {
@@ -618,6 +766,9 @@ func isStreamUnsupportedAIError(err error) bool {
 	}
 
 	errText := strings.ToLower(err.Error())
+	if strings.Contains(errText, "reasoning_content") {
+		return false
+	}
 	streamHints := []string{
 		"stream",
 		"streaming",
@@ -644,6 +795,29 @@ func isStreamUnsupportedAIError(err error) bool {
 	return containsAny(errText, streamHints...) && (containsAny(errText, unsupportedHints...) || containsAny(errText, statusHints...))
 }
 
+func isContextOverflowAIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	markers := []string{
+		"status code: 413",
+		"413 request entity too large",
+		"context length",
+		"context_length",
+		"context window",
+		"context-window",
+		"context window exceeded",
+		"maximum context",
+		"max context",
+		"prompt is too long",
+		"prompt too long",
+		"too many input tokens",
+		"input tokens",
+	}
+	return containsAny(errText, markers...)
+}
+
 func containsAny(value string, needles ...string) bool {
 	for _, needle := range needles {
 		if needle != "" && strings.Contains(value, needle) {
@@ -651,6 +825,32 @@ func containsAny(value string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+type chatCompletionPurpose string
+
+const (
+	chatCompletionPurposeMainScan  chatCompletionPurpose = "main_scan"
+	chatCompletionPurposeAuxiliary chatCompletionPurpose = "auxiliary"
+)
+
+func prepareChatCompletionRequest(req openai.ChatCompletionRequest, purpose chatCompletionPurpose) openai.ChatCompletionRequest {
+	thinking := config.AI.Thinking
+	if !thinking.Enabled {
+		return req
+	}
+	if purpose == chatCompletionPurposeAuxiliary && !thinking.ApplyToAuxiliary {
+		return req
+	}
+
+	req.ReasoningEffort = thinking.Effort
+	if req.ReasoningEffort == "" {
+		req.ReasoningEffort = "high"
+	}
+	if thinking.MaxCompletionTokens > 0 {
+		req.MaxCompletionTokens = thinking.MaxCompletionTokens
+	}
+	return req
 }
 
 func createChatCompletionWithRetry(
@@ -681,23 +881,44 @@ func createChatCompletionWithRetry(
 
 	var resp openai.ChatCompletionResponse
 	var err error
+	attemptReq := req
+	retriedWithoutReasoningContent := false
+	retriedWithoutThinkingParams := false
 	for attempt := 1; attempt <= attempts; attempt++ {
 		attemptTimeout := currentTimeout
-		ctxReq, cancel := context.WithTimeout(ctx, attemptTimeout)
 		var receivedChunk bool
-		resp, receivedChunk, err = createChatCompletion(ctxReq, client, req)
-		cancel()
+		for {
+			ctxReq, cancel := context.WithTimeout(ctx, attemptTimeout)
+			resp, receivedChunk, err = createChatCompletion(ctxReq, client, attemptReq)
+			cancel()
+			if err == nil {
+				return resp, nil
+			}
+			if !receivedChunk && !retriedWithoutReasoningContent && shouldRetryWithoutReasoningContent(attemptReq, err) {
+				attemptReq = stripChatCompletionReasoningContent(attemptReq)
+				retriedWithoutReasoningContent = true
+				continue
+			}
+			if !receivedChunk && !retriedWithoutThinkingParams && shouldRetryWithoutThinkingParams(attemptReq, err) {
+				log.Printf("Warning: AI API does not support configured thinking parameters; retrying without reasoning_effort/max_completion_tokens: %v", err)
+				attemptReq = stripChatCompletionThinkingParams(attemptReq)
+				retriedWithoutThinkingParams = true
+				continue
+			}
+			break
+		}
 		if err == nil {
 			return resp, nil
 		}
 		timeoutLike := isAIRequestTimeout(err)
-		if receivedChunk && !timeoutLike {
+		retryable := isRetryableAIError(err)
+		if receivedChunk && !retryable {
 			if hooks.onNonRetryable != nil {
 				hooks.onNonRetryable(attempt, attempts, attemptTimeout, err)
 			}
 			return openai.ChatCompletionResponse{}, err
 		}
-		if !isRetryableAIError(err) {
+		if !retryable {
 			if hooks.onNonRetryable != nil {
 				hooks.onNonRetryable(attempt, attempts, attemptTimeout, err)
 			}
@@ -723,6 +944,116 @@ func createChatCompletionWithRetry(
 	}
 
 	return openai.ChatCompletionResponse{}, err
+}
+
+func shouldRetryWithoutReasoningContent(req openai.ChatCompletionRequest, err error) bool {
+	return chatCompletionRequestHasReasoningContent(req) && isReasoningContentUnsupportedAIError(err)
+}
+
+func shouldRetryWithoutThinkingParams(req openai.ChatCompletionRequest, err error) bool {
+	return chatCompletionRequestHasThinkingParams(req) && isThinkingParamsUnsupportedAIError(err)
+}
+
+func chatCompletionRequestHasReasoningContent(req openai.ChatCompletionRequest) bool {
+	for _, msg := range req.Messages {
+		if msg.ReasoningContent != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func chatCompletionRequestHasThinkingParams(req openai.ChatCompletionRequest) bool {
+	return req.ReasoningEffort != "" || req.MaxCompletionTokens > 0
+}
+
+func stripChatCompletionReasoningContent(req openai.ChatCompletionRequest) openai.ChatCompletionRequest {
+	if len(req.Messages) == 0 {
+		return req
+	}
+	stripped := req
+	stripped.Messages = append([]openai.ChatCompletionMessage(nil), req.Messages...)
+	for i := range stripped.Messages {
+		stripped.Messages[i].ReasoningContent = ""
+	}
+	return stripped
+}
+
+func stripChatCompletionThinkingParams(req openai.ChatCompletionRequest) openai.ChatCompletionRequest {
+	stripped := req
+	stripped.ReasoningEffort = ""
+	stripped.MaxCompletionTokens = 0
+	return stripped
+}
+
+func isReasoningContentUnsupportedAIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	if !strings.Contains(errText, "reasoning_content") || isReasoningContentRequiredAIError(errText) {
+		return false
+	}
+	unsupportedMarkers := []string{
+		"unsupported",
+		"not supported",
+		"not support",
+		"not allowed",
+		"not permitted",
+		"disallowed",
+		"unknown",
+		"unrecognized",
+		"unrecognised",
+		"unexpected",
+		"additional propert",
+		"extra field",
+		"invalid field",
+		"invalid parameter",
+		"invalid request",
+	}
+	return containsAny(errText, unsupportedMarkers...)
+}
+
+func isThinkingParamsUnsupportedAIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	if !strings.Contains(errText, "reasoning_effort") && !strings.Contains(errText, "max_completion_tokens") {
+		return false
+	}
+	unsupportedMarkers := []string{
+		"unsupported",
+		"not supported",
+		"not support",
+		"not allowed",
+		"not permitted",
+		"disallowed",
+		"unknown",
+		"unrecognized",
+		"unrecognised",
+		"unexpected",
+		"additional propert",
+		"extra field",
+		"invalid field",
+		"invalid parameter",
+		"invalid request",
+	}
+	return containsAny(errText, unsupportedMarkers...)
+}
+
+func isReasoningContentRequiredAIError(errText string) bool {
+	if errText == "" {
+		return false
+	}
+	requiredMarkers := []string{
+		"must be passed back",
+		"must be pass back",
+		"must pass back",
+		"must be provided",
+		"must be included",
+	}
+	return strings.Contains(errText, "reasoning_content") && containsAny(errText, requiredMarkers...)
 }
 
 func aiRequestTimeoutMemoryKey(baseURL, model string) string {
@@ -810,6 +1141,7 @@ func resolveToolPath(basePath string, path string) (string, error) {
 type messageHistoryStats struct {
 	droppedToolMessages   int
 	droppedIncompleteRuns int
+	toolCallStats         toolCallNormalizationStats
 }
 
 type compressionWindowSelection struct {
@@ -822,21 +1154,27 @@ type compressionWindowSelection struct {
 }
 
 func (s messageHistoryStats) changed() bool {
-	return s.droppedToolMessages > 0 || s.droppedIncompleteRuns > 0
+	return s.droppedToolMessages > 0 || s.droppedIncompleteRuns > 0 || s.toolCallStats.changed()
 }
 
 func (s messageHistoryStats) summary(context string) string {
 	parts := []string{}
 	if s.droppedToolMessages > 0 {
-		parts = append(parts, fmt.Sprintf("%d orphan/mismatched tool messages", s.droppedToolMessages))
+		parts = append(parts, fmt.Sprintf("dropped %d orphan/mismatched tool messages", s.droppedToolMessages))
 	}
 	if s.droppedIncompleteRuns > 0 {
-		parts = append(parts, fmt.Sprintf("%d incomplete assistant tool-call rounds", s.droppedIncompleteRuns))
+		parts = append(parts, fmt.Sprintf("dropped %d incomplete assistant tool-call rounds", s.droppedIncompleteRuns))
+	}
+	if s.toolCallStats.droppedInvalidToolCalls > 0 {
+		parts = append(parts, fmt.Sprintf("dropped %d invalid assistant tool calls", s.toolCallStats.droppedInvalidToolCalls))
+	}
+	if s.toolCallStats.generatedToolCallIDs > 0 {
+		parts = append(parts, fmt.Sprintf("generated %d local tool_call ids", s.toolCallStats.generatedToolCallIDs))
 	}
 	if len(parts) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s: removed %s.", context, strings.Join(parts, " and "))
+	return fmt.Sprintf("%s: %s.", context, strings.Join(parts, "; "))
 }
 
 func sanitizeMessageHistory(messages []openai.ChatCompletionMessage) ([]openai.ChatCompletionMessage, messageHistoryStats) {
@@ -886,12 +1224,15 @@ func sanitizeMessageHistory(messages []openai.ChatCompletionMessage) ([]openai.C
 			}
 		}
 
-		sanitized = append(sanitized, msg)
+		normalizedMsg, toolCallStats := normalizeToolCallMessage(msg)
+		stats.toolCallStats.add(toolCallStats)
 
-		if len(msg.ToolCalls) > 0 {
+		sanitized = append(sanitized, normalizedMsg)
+
+		if len(normalizedMsg.ToolCalls) > 0 {
 			pendingAssistantIdx = len(sanitized) - 1
-			pendingToolCalls = make(map[string]struct{}, len(msg.ToolCalls))
-			for _, toolCall := range msg.ToolCalls {
+			pendingToolCalls = make(map[string]struct{}, len(normalizedMsg.ToolCalls))
+			for _, toolCall := range normalizedMsg.ToolCalls {
 				if toolCall.ID == "" {
 					continue
 				}
@@ -966,21 +1307,11 @@ func isRetryableAIError(err error) bool {
 	if isAIRequestTimeout(err) {
 		return true
 	}
+	if isNonRetryableAIError(err) {
+		return false
+	}
 
 	errText := strings.ToLower(err.Error())
-
-	nonRetryableMarkers := []string{
-		"status code: 400",
-		"400 bad request",
-		"invalid_request_error",
-		"no tool call found",
-	}
-	for _, marker := range nonRetryableMarkers {
-		if strings.Contains(errText, marker) {
-			return false
-		}
-	}
-
 	retryableMarkers := []string{
 		"status code: 408",
 		"status code: 429",
@@ -998,7 +1329,55 @@ func isRetryableAIError(err error) bool {
 		}
 	}
 
-	return false
+	return isRetryableAITransportError(err)
+}
+
+func isNonRetryableAIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	nonRetryableMarkers := []string{
+		"status code: 400",
+		"400 bad request",
+		"invalid_request_error",
+		"no tool call found",
+	}
+	return containsAny(errText, nonRetryableMarkers...)
+}
+
+func isRetryableAITransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+
+	errText := strings.ToLower(err.Error())
+	transportMarkers := []string{
+		"stream error",
+		"http2",
+		"http/2",
+		"goaway",
+		"refused_stream",
+		"internal_error",
+		"unexpected eof",
+		"connection reset",
+		"connection refused",
+		"connection aborted",
+		"broken pipe",
+		"server closed",
+		"client connection lost",
+		"use of closed network connection",
+		"forcibly closed",
+	}
+	return containsAny(errText, transportMarkers...)
 }
 
 func compressHistory(
@@ -1061,10 +1440,10 @@ IMPORTANT: Do NOT use any tools. Just provide the summary text.`,
 	contextToSummarize = append(contextToSummarize, window.selectedMessages...)
 	contextToSummarize = append(contextToSummarize, summaryRequest...)
 
-	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+	resp, err := createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 		Model:    config.AI.Model,
 		Messages: contextToSummarize,
-	}, chatCompletionRetryHooks{})
+	}, chatCompletionPurposeAuxiliary), chatCompletionRetryHooks{})
 
 	if err != nil {
 		log.Printf("Error compressing history: %v. Resetting to prompt plus summary.", err)
@@ -1130,6 +1509,12 @@ CURRENT STAGE: %s`, stage)
 }
 
 func RepairJSON(content string, stage string) (string, error) {
+	normalizedStage, ok := NormalizeRepairStage(stage)
+	if !ok {
+		return "", fmt.Errorf("unsupported repair stage: %s", strings.TrimSpace(stage))
+	}
+	stage = normalizedStage
+
 	client := aiClientFactory()
 
 	schemaInstruction := ""
@@ -1365,19 +1750,23 @@ RAW_DATA>>>>
 `, schemaInstruction, repairChineseNarrativeRules(stage), content)
 
 	ctx := context.Background()
-	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+	resp, err := createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 		Model: config.AI.Model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},
-	}, chatCompletionRetryHooks{})
+	}, chatCompletionPurposeAuxiliary), chatCompletionRetryHooks{})
 
 	if err != nil {
 		return "", err
 	}
 
 	result := resp.Choices[0].Message.Content
-	return extractJSON(result), nil
+	_, repaired, err := ParseValidatedRepairJSON(result, stage)
+	if err != nil {
+		return "", err
+	}
+	return string(repaired), nil
 }
 
 func runAIScan(task *model.Task, stage string, kind StageRunKind, resume bool, options ScanExecutionOptions) {
@@ -2386,22 +2775,82 @@ Base Path: %s
 		_ = session.markStatus(runtimeStatusFailed)
 		logFunc(message)
 	}
+	failRunWithRawOutput := func(prefix string, runErr error, rawOutput string) {
+		message := prefix + runErr.Error()
+		result := resultWithProcessingError(rawOutput, message)
+		task.Result = result
+		if options.ManageTaskStatus {
+			task.Status = "failed"
+		}
+		persistTaskRecord()
+		if currentStage != nil {
+			currentStage.Status = "failed"
+			currentStage.Result = result
+			saveTaskStageRecord(currentStage)
+		}
+		_ = session.markStatus(runtimeStatusFailed)
+		logFunc(message)
+	}
 
 	// Chat Loop
 	const maxIterations = 200
-	softLimitTokens := config.Scanner.ContextCompression.SoftLimitTokens
-	hardLimitTokens := config.Scanner.ContextCompression.HardLimitTokens
-	softLimitBytes := config.Scanner.ContextCompression.SoftLimitBytes
-	hardLimitBytes := config.Scanner.ContextCompression.HardLimitBytes
+	compressionPolicy := config.Scanner.ContextCompression
+	microLimitTokens := compressionPolicy.MicrocompactLimitTokens
+	fullLimitTokens := compressionPolicy.FullCompactLimitTokens
+	hardLimitTokens := compressionPolicy.HardLimitTokens
+	hardLimitBytes := compressionPolicy.HardLimitBytes
 	logFunc(fmt.Sprintf(
-		"Context policy configured: API prompt soft=%d tokens, hard=%d tokens; byte fallback soft=%d, hard=%d; summary_window=%d messages.",
-		softLimitTokens,
+		"Context policy configured: window=%d tokens, summary_reserved=%d, safety=%d, micro=%d, full=%d, hard=%d, target_after_compact=%d, hard byte fallback=%d bytes, summary_window=%d messages.",
+		compressionPolicy.ContextWindowTokens,
+		compressionPolicy.SummaryReservedTokens,
+		compressionPolicy.SafetyBufferTokens,
+		microLimitTokens,
+		fullLimitTokens,
 		hardLimitTokens,
-		softLimitBytes,
+		compressionPolicy.TargetAfterCompactTokens,
 		hardLimitBytes,
-		config.Scanner.ContextCompression.SummaryWindowMessages,
+		compressionPolicy.SummaryWindowMessages,
 	))
+	runFullCompact := func(reason string, respectFuse bool) (bool, error) {
+		if respectFuse && session.state.ConsecutiveCompactFailures >= 3 {
+			logFunc(fmt.Sprintf(
+				"Automatic full context compression paused after %d ineffective runs. Microcompact and reactive overflow recovery remain enabled.",
+				session.state.ConsecutiveCompactFailures,
+			))
+			return false, nil
+		}
+		if reason != "" {
+			logFunc(reason)
+		}
+		if err := session.compressHistory(ctx, client, logFunc); err != nil {
+			return false, err
+		}
+
+		postMessages := chatMessagesFromEntries(session.buildChatEntries())
+		postTokens := estimateContextTokens(postMessages)
+		if fullLimitTokens > 0 && postTokens >= fullLimitTokens {
+			session.state.ConsecutiveCompactFailures++
+			if err := session.saveState(); err != nil {
+				return true, err
+			}
+			logFunc(fmt.Sprintf(
+				"Context compression finished but estimated prompt tokens remain %d (full=%d); ineffective full compactions=%d/3.",
+				postTokens,
+				fullLimitTokens,
+				session.state.ConsecutiveCompactFailures,
+			))
+			return true, nil
+		}
+		if session.state.ConsecutiveCompactFailures != 0 {
+			session.state.ConsecutiveCompactFailures = 0
+			if err := session.saveState(); err != nil {
+				return true, err
+			}
+		}
+		return true, nil
+	}
 	usageUnavailableLogged := false
+	consecutiveContextOverflowCompactions := 0
 	for i := 0; i < maxIterations; i++ {
 		if pauseRequested(task.ID, stage) {
 			if options.ManageTaskStatus {
@@ -2419,16 +2868,8 @@ Base Path: %s
 
 		session.maybeUpdateSessionMemory(ctx, client, logFunc)
 
-		entries, sessionErr := session.applyMicrocompact(session.buildChatEntries(), logFunc)
-		if sessionErr != nil {
-			failRun("Runtime error: ", sessionErr)
-			return
-		}
-
-		messages := make([]openai.ChatCompletionMessage, 0, len(entries))
-		for _, entry := range entries {
-			messages = append(messages, entry.Chat)
-		}
+		entries := session.buildChatEntries()
+		messages := chatMessagesFromEntries(entries)
 
 		var resp openai.ChatCompletionResponse
 		var callErr error
@@ -2442,13 +2883,68 @@ Base Path: %s
 		}
 		messages = safeMessages
 
+		estimatedPromptTokens := estimateContextTokens(messages)
+		if microLimitTokens > 0 && estimatedPromptTokens >= microLimitTokens {
+			var sessionErr error
+			entries, sessionErr = session.applyMicrocompact(entries, logFunc)
+			if sessionErr != nil {
+				failRun("Runtime error: ", sessionErr)
+				return
+			}
+			messages = chatMessagesFromEntries(entries)
+			messages, sanitizeStats = sanitizeMessageHistory(messages)
+			if sanitizeStats.changed() {
+				if summary := sanitizeStats.summary("Sanitized conversation history after microcompact"); summary != "" {
+					logFunc(summary)
+				}
+			}
+			estimatedPromptTokens = estimateContextTokens(messages)
+		}
+		if hardLimitTokens > 0 && estimatedPromptTokens >= hardLimitTokens {
+			if _, err := runFullCompact(fmt.Sprintf(
+				"Estimated prompt tokens reached %d (hard=%d). Compressing context before the next AI request.",
+				estimatedPromptTokens,
+				hardLimitTokens,
+			), false); err != nil {
+				failRun("Compression error: ", err)
+				return
+			}
+			continue
+		}
+		if totalBytes := calculateContextBytes(messages); hardLimitBytes > 0 && totalBytes > hardLimitBytes {
+			if _, err := runFullCompact(fmt.Sprintf(
+				"Hard byte fallback reached before AI request at %d bytes (hard=%d). Tail: %s",
+				totalBytes,
+				hardLimitBytes,
+				summarizeMessageTailBytes(messages, 4),
+			), false); err != nil {
+				failRun("Compression error: ", err)
+				return
+			}
+			continue
+		}
+		if fullLimitTokens > 0 && estimatedPromptTokens >= fullLimitTokens {
+			ran, err := runFullCompact(fmt.Sprintf(
+				"Estimated prompt tokens reached %d (full=%d). Compressing context before the next AI request.",
+				estimatedPromptTokens,
+				fullLimitTokens,
+			), true)
+			if err != nil {
+				failRun("Compression error: ", err)
+				return
+			}
+			if ran {
+				continue
+			}
+		}
+
 		flushLogs()
 
-		resp, callErr = createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+		resp, callErr = createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 			Model:    executionProfile.Model,
 			Messages: messages,
 			Tools:    Tools,
-		}, chatCompletionRetryHooks{
+		}, chatCompletionPurposeMainScan), chatCompletionRetryHooks{
 			onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
 				if timeoutLike {
 					logFunc(fmt.Sprintf(
@@ -2484,6 +2980,19 @@ Base Path: %s
 		})
 
 		if callErr != nil {
+			if isContextOverflowAIError(callErr) && consecutiveContextOverflowCompactions < 3 {
+				consecutiveContextOverflowCompactions++
+				logFunc(fmt.Sprintf(
+					"AI request exceeded the model context window. Compressing context and retrying (%d/3): %v",
+					consecutiveContextOverflowCompactions,
+					callErr,
+				))
+				if err := session.compressHistory(ctx, client, logFunc); err != nil {
+					failRun("Compression error: ", err)
+					return
+				}
+				continue
+			}
 			errPrefix := "AI Error after retries: "
 			if nonRetryableAbort {
 				errPrefix = "AI Error: "
@@ -2491,15 +3000,19 @@ Base Path: %s
 			failRun(errPrefix, callErr)
 			return
 		}
+		consecutiveContextOverflowCompactions = 0
 		if hasTokenUsage(resp.Usage) {
-			logFunc(formatTokenUsageLog(resp.Usage, softLimitTokens, hardLimitTokens))
+			logFunc(formatTokenUsageLog(resp.Usage, microLimitTokens, fullLimitTokens, hardLimitTokens))
 			usageUnavailableLogged = false
 		} else if !usageUnavailableLogged {
-			logFunc("AI API did not return token usage for this request. Context control will fall back to byte-based limits when needed.")
+			logFunc("AI API did not return token usage for this request. Context control will fall back to the hard byte limit when needed.")
 			usageUnavailableLogged = true
 		}
 
-		msg := resp.Choices[0].Message
+		msg, toolCallStats := normalizeToolCallMessage(resp.Choices[0].Message)
+		if summary := toolCallStats.summary("Normalized assistant tool calls before persistence"); summary != "" {
+			logFunc(summary)
+		}
 		if err := session.appendChatMessage(msg); err != nil {
 			failRun("Runtime error: ", err)
 			return
@@ -2517,7 +3030,7 @@ Base Path: %s
 			}
 			outputJSON, meta, finalizeErr := finalizeRunOutput(task, stage, currentStage, kind, msg.Content)
 			if finalizeErr != nil {
-				failRun("Result processing error: ", finalizeErr)
+				failRunWithRawOutput("Result processing error: ", finalizeErr, msg.Content)
 				return
 			}
 
@@ -2566,97 +3079,71 @@ Base Path: %s
 		session.maybeUpdateSessionMemory(ctx, client, logFunc)
 
 		entries = session.buildChatEntries()
-		messages = make([]openai.ChatCompletionMessage, 0, len(entries))
-		for _, entry := range entries {
-			messages = append(messages, entry.Chat)
-		}
+		messages = chatMessagesFromEntries(entries)
 
 		promptTokensLowerBound := resp.Usage.PromptTokens
 		if hasTokenUsage(resp.Usage) {
 			if hardLimitTokens > 0 && promptTokensLowerBound >= hardLimitTokens {
-				logFunc(fmt.Sprintf(
+				if _, err := runFullCompact(fmt.Sprintf(
 					"API-reported prompt tokens already reached %d (hard=%d). Compressing context before the next request.",
 					promptTokensLowerBound,
 					hardLimitTokens,
-				))
-				if err := session.compressHistory(ctx, client, logFunc); err != nil {
+				), false); err != nil {
 					failRun("Compression error: ", err)
 					return
 				}
 				continue
 			}
-			if softLimitTokens > 0 && promptTokensLowerBound >= softLimitTokens {
-				originalBytes, updatedBytes, changed, truncateErr := session.truncateLastToolMessage(20000)
-				if truncateErr != nil {
-					failRun("Runtime error: ", truncateErr)
+			totalBytes := calculateContextBytes(messages)
+			if hardLimitBytes > 0 && totalBytes > hardLimitBytes {
+				if _, err := runFullCompact(fmt.Sprintf(
+					"Hard byte fallback reached at %d bytes (hard=%d). Tail: %s",
+					totalBytes,
+					hardLimitBytes,
+					summarizeMessageTailBytes(messages, 4),
+				), false); err != nil {
+					failRun("Compression error: ", err)
 					return
 				}
-				if changed {
-					logFunc(fmt.Sprintf(
-						"API-reported prompt tokens reached %d (soft=%d). Proactively truncated the latest tool output from %d to %d bytes before the next request.",
-						promptTokensLowerBound,
-						softLimitTokens,
-						originalBytes,
-						updatedBytes,
-					))
-					entries = session.buildChatEntries()
-					messages = make([]openai.ChatCompletionMessage, 0, len(entries))
-					for _, entry := range entries {
-						messages = append(messages, entry.Chat)
-					}
+				continue
+			}
+			if fullLimitTokens > 0 && promptTokensLowerBound >= fullLimitTokens {
+				ran, err := runFullCompact(fmt.Sprintf(
+					"API-reported prompt tokens reached %d (full=%d). Compressing context before the next request.",
+					promptTokensLowerBound,
+					fullLimitTokens,
+				), true)
+				if err != nil {
+					failRun("Compression error: ", err)
+					return
 				}
+				if ran {
+					continue
+				}
+			}
+			if microLimitTokens > 0 && promptTokensLowerBound >= microLimitTokens {
+				var sessionErr error
+				entries, _, sessionErr = session.maybeApplyMicrocompactForPromptTokens(resp.Usage, microLimitTokens, logFunc)
+				if sessionErr != nil {
+					failRun("Runtime error: ", sessionErr)
+					return
+				}
+				messages = chatMessagesFromEntries(entries)
 			}
 		}
 
 		totalBytes := calculateContextBytes(messages)
-		if totalBytes > hardLimitBytes {
-			logFunc(fmt.Sprintf(
-				"Hard context limit reached at %d bytes (soft=%d, hard=%d). Tail: %s",
+		if hardLimitBytes > 0 && totalBytes > hardLimitBytes {
+			if _, err := runFullCompact(fmt.Sprintf(
+				"Hard byte fallback reached at %d bytes (hard=%d). Tail: %s",
 				totalBytes,
-				softLimitBytes,
 				hardLimitBytes,
 				summarizeMessageTailBytes(messages, 4),
-			))
-			if err := session.compressHistory(ctx, client, logFunc); err != nil {
+			), false); err != nil {
 				failRun("Compression error: ", err)
 				return
 			}
 			continue
-		}
-		if totalBytes > softLimitBytes {
-			originalBytes, updatedBytes, changed, truncateErr := session.truncateLastToolMessage(20000)
-			if truncateErr != nil {
-				failRun("Runtime error: ", truncateErr)
-				return
-			}
-			if changed {
-				logFunc(fmt.Sprintf(
-					"Soft context limit reached at %d bytes (soft=%d, hard=%d). Truncated last tool output from %d to %d bytes.",
-					totalBytes,
-					softLimitBytes,
-					hardLimitBytes,
-					originalBytes,
-					updatedBytes,
-				))
-			}
-			entries = session.buildChatEntries()
-			messages = make([]openai.ChatCompletionMessage, 0, len(entries))
-			for _, entry := range entries {
-				messages = append(messages, entry.Chat)
-			}
-			totalBytes = calculateContextBytes(messages)
-			if totalBytes > hardLimitBytes {
-				logFunc(fmt.Sprintf(
-					"Soft truncation insufficient; still at %d bytes. Tail: %s",
-					totalBytes,
-					summarizeMessageTailBytes(messages, 4),
-				))
-				if err := session.compressHistory(ctx, client, logFunc); err != nil {
-					failRun("Compression error: ", err)
-					return
-				}
-				continue
-			}
 		}
 	}
 
@@ -2670,13 +3157,10 @@ Base Path: %s
 		lastContent = activeEntries[len(activeEntries)-1].Chat.Content
 	}
 	task.Result = "Analysis finished (limit reached). Last output: " + lastContent
-
-	jsonPart := extractJSON(lastContent)
-	var outputJSON json.RawMessage
-	if json.Valid([]byte(jsonPart)) {
-		outputJSON = json.RawMessage(jsonPart)
-	} else {
-		outputJSON = json.RawMessage("[]")
+	outputJSON, meta, finalizeErr := finalizeRunOutput(task, stage, currentStage, kind, lastContent)
+	if finalizeErr != nil {
+		failRunWithRawOutput("Result processing error: ", finalizeErr, lastContent)
+		return
 	}
 
 	if currentStage != nil {
@@ -2684,6 +3168,7 @@ Base Path: %s
 		currentStage.Result = lastContent
 		currentStage.UpdatedAt = time.Now()
 		currentStage.OutputJSON = outputJSON
+		currentStage.Meta = meta
 		saveTaskStageRecord(currentStage)
 	} else {
 		task.OutputJSON = outputJSON

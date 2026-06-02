@@ -19,17 +19,6 @@ const (
 	StageRunRevalidate StageRunKind = "revalidate"
 )
 
-var stageFindingTypes = map[string]string{
-	"rce":       "RCE",
-	"injection": "Injection",
-	"auth":      "Authentication",
-	"access":    "Authorization",
-	"xss":       "XSS",
-	"config":    "Configuration",
-	"fileop":    "FileOperation",
-	"logic":     "BusinessLogic",
-}
-
 func normalizeStageRunKind(value string) StageRunKind {
 	switch StageRunKind(strings.TrimSpace(strings.ToLower(value))) {
 	case StageRunGapCheck:
@@ -225,13 +214,9 @@ func finalizeRunOutput(
 
 func parseJSONArrayOutputWithRepair(content string, stage string) ([]map[string]any, error) {
 	parse := func(raw string) ([]map[string]any, error) {
-		jsonPart := extractJSON(raw)
-		if !json.Valid([]byte(jsonPart)) {
-			return nil, fmt.Errorf("AI output is not valid JSON")
-		}
-		items, ok := summarysvc.ParseJSONArray(json.RawMessage(jsonPart), "")
-		if !ok {
-			return nil, fmt.Errorf("AI output is not a JSON array")
+		items, _, err := ParseValidatedRepairJSON(raw, stage)
+		if err != nil {
+			return nil, err
 		}
 		return items, nil
 	}
@@ -243,7 +228,7 @@ func parseJSONArrayOutputWithRepair(content string, stage string) ([]map[string]
 
 	repaired, repairErr := RepairJSON(content, stage)
 	if repairErr != nil {
-		return nil, err
+		return nil, repairErr
 	}
 	items, repairedErr := parse(repaired)
 	if repairedErr != nil {

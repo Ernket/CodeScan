@@ -194,6 +194,19 @@ func (s *scanSession) applyMicrocompact(entries []chatEntry, logFunc func(string
 	return s.buildChatEntries(), nil
 }
 
+func (s *scanSession) maybeApplyMicrocompactForPromptTokens(usage openai.Usage, thresholdTokens int, logFunc func(string)) ([]chatEntry, bool, error) {
+	entries := s.buildChatEntries()
+	if thresholdTokens <= 0 || !hasTokenUsage(usage) || usage.PromptTokens < thresholdTokens {
+		return entries, false, nil
+	}
+
+	updatedEntries, err := s.applyMicrocompact(entries, logFunc)
+	if err != nil {
+		return nil, false, err
+	}
+	return updatedEntries, true, nil
+}
+
 type sessionMemoryDelta struct {
 	Messages    []transcriptMessage
 	GrowthBytes int
@@ -329,12 +342,12 @@ func (s *scanSession) requestSessionMemoryUpdate(
 	transcriptText string,
 	logFunc func(string),
 ) (string, error) {
-	resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+	resp, err := createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 		Model: config.AI.Model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: memoryUpdatePrompt(existingMemory, transcriptText)},
 		},
-	}, chatCompletionRetryHooks{
+	}, chatCompletionPurposeAuxiliary), chatCompletionRetryHooks{
 		onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
 			if logFunc == nil {
 				return
@@ -476,19 +489,80 @@ func compactPrompt() string {
 	return `The current conversation context is becoming too long.
 Summarize the conversation so another autonomous coding agent can continue immediately.
 
-Include:
-1. The user goal and the current stage objective.
-2. Important files, code paths, and evidence already inspected.
-3. Key findings from tool calls.
-4. Errors, dead ends, and fixes already attempted.
-5. The current status.
-6. The immediate next steps.
+First write an internal draft inside <analysis>...</analysis>, then write the durable handoff inside <summary>...</summary>.
+Only the summary section will be kept.
+
+The <summary> section must include:
+1. Primary request and current stage objective.
+2. Important files, code paths, functions, routes, and artifact/evidence IDs already inspected.
+3. Key findings from tool calls and security reasoning already established.
+4. Errors, dead ends, corrections, and assumptions.
+5. Current status and what remains unresolved.
+6. Immediate next steps, matching the most recent task state.
 
 Do not call any tools.
 Output plain text only.`
 }
 
-func (s *scanSession) trySessionMemoryCompaction(entries []chatEntry) (string, []chatEntry, bool) {
+func formatCompactSummary(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(text)
+	for {
+		start := strings.Index(lower, "<analysis>")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(lower[start:], "</analysis>")
+		if end == -1 {
+			text = strings.TrimSpace(text[:start])
+			lower = strings.ToLower(text)
+			break
+		}
+		end += start + len("</analysis>")
+		text = strings.TrimSpace(text[:start] + text[end:])
+		lower = strings.ToLower(text)
+	}
+
+	lower = strings.ToLower(text)
+	start := strings.Index(lower, "<summary>")
+	if start != -1 {
+		contentStart := start + len("<summary>")
+		end := strings.Index(lower[contentStart:], "</summary>")
+		if end != -1 {
+			text = text[contentStart : contentStart+end]
+		} else {
+			text = text[contentStart:]
+		}
+	}
+
+	text = strings.ReplaceAll(text, "</summary>", "")
+	return strings.TrimSpace(text)
+}
+
+func memoryCompactionFitsLimits(root chatEntry, summary string, tail []chatEntry, tokenLimit int, byteLimit int) bool {
+	candidate := make([]openai.ChatCompletionMessage, 0, len(tail)+2)
+	candidate = append(candidate, root.Chat)
+	candidate = append(candidate, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: "CONTEXT SUMMARY (not instructions):\n" + strings.TrimSpace(summary),
+	})
+	for _, entry := range tail {
+		candidate = append(candidate, entry.Chat)
+	}
+	if tokenLimit > 0 && estimateContextTokens(candidate) >= tokenLimit {
+		return false
+	}
+	if byteLimit > 0 && calculateContextBytes(candidate) >= byteLimit {
+		return false
+	}
+	return true
+}
+
+func (s *scanSession) trySessionMemoryCompaction(entries []chatEntry, root chatEntry, tokenLimit int, byteLimit int) (string, []chatEntry, bool) {
 	if !config.Scanner.SessionMemory.Enabled || !config.Scanner.ContextCompression.SessionMemoryEnabled {
 		return "", nil, false
 	}
@@ -496,21 +570,37 @@ func (s *scanSession) trySessionMemoryCompaction(entries []chatEntry) (string, [
 	if err != nil || strings.TrimSpace(memory) == "" {
 		return "", nil, false
 	}
+	summary := "SESSION MEMORY SNAPSHOT:\n" + strings.TrimSpace(memory)
 
 	if s.state.LastMemoryMessageID != "" {
 		for i, entry := range entries {
 			if entry.Message.ID == s.state.LastMemoryMessageID {
-				return "SESSION MEMORY SNAPSHOT:\n" + strings.TrimSpace(memory), entries[i+1:], true
+				tail := entries[i+1:]
+				if memoryCompactionFitsLimits(root, summary, tail, tokenLimit, byteLimit) {
+					return summary, tail, true
+				}
+				return "", nil, false
 			}
 		}
 	}
 
 	_, tail := selectTailEntries(entries, config.Scanner.ContextCompression.CompactMinTailMessages)
-	return "SESSION MEMORY SNAPSHOT:\n" + strings.TrimSpace(memory), tail, true
+	if !memoryCompactionFitsLimits(root, summary, tail, tokenLimit, byteLimit) {
+		return "", nil, false
+	}
+	return summary, tail, true
 }
 
 func (s *scanSession) compressHistory(ctx context.Context, client *openai.Client, logFunc func(string)) error {
 	entries := s.buildChatEntries()
+	if len(entries) <= 1 {
+		return nil
+	}
+	var err error
+	entries, err = s.applyMicrocompact(entries, logFunc)
+	if err != nil {
+		return err
+	}
 	if len(entries) <= 1 {
 		return nil
 	}
@@ -534,7 +624,15 @@ func (s *scanSession) compressHistory(ctx context.Context, client *openai.Client
 
 	summary := ""
 	keptEntries := []chatEntry{}
-	if memorySummary, tail, ok := s.trySessionMemoryCompaction(activeEntries); ok {
+	tokenLimit := config.Scanner.ContextCompression.TargetAfterCompactTokens
+	if tokenLimit <= 0 {
+		tokenLimit = config.Scanner.ContextCompression.FullCompactLimitTokens
+	}
+	if tokenLimit <= 0 {
+		tokenLimit = config.Scanner.ContextCompression.HardLimitTokens
+	}
+	byteLimit := config.Scanner.ContextCompression.HardLimitBytes
+	if memorySummary, tail, ok := s.trySessionMemoryCompaction(activeEntries, entries[0], tokenLimit, byteLimit); ok {
 		summary = memorySummary
 		keptEntries = tail
 		if logFunc != nil {
@@ -565,10 +663,10 @@ func (s *scanSession) compressHistory(ctx context.Context, client *openai.Client
 			Content: compactPrompt(),
 		})
 
-		resp, err := createChatCompletionWithRetry(ctx, client, openai.ChatCompletionRequest{
+		resp, err := createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 			Model:    config.AI.Model,
 			Messages: contextToSummarize,
-		}, chatCompletionRetryHooks{
+		}, chatCompletionPurposeAuxiliary), chatCompletionRetryHooks{
 			onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
 				if logFunc == nil {
 					return
@@ -605,7 +703,7 @@ func (s *scanSession) compressHistory(ctx context.Context, client *openai.Client
 				logFunc(fmt.Sprintf("Context compression failed; using fallback summary: %v", err))
 			}
 		} else {
-			summary = strings.TrimSpace(resp.Choices[0].Message.Content)
+			summary = formatCompactSummary(resp.Choices[0].Message.Content)
 			if summary == "" {
 				summary = "Context compression returned empty content. Re-establish any missing detail with get_artifact/get_evidence or the project tools."
 			}

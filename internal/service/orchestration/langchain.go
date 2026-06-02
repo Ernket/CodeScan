@@ -55,6 +55,32 @@ func NewLangChainModel(role string) (llms.Model, error) {
 	return lcopenai.New(options...)
 }
 
+func LangChainThinkingOptions() []llms.CallOption {
+	thinking := config.AI.Thinking
+	if !thinking.Enabled {
+		return nil
+	}
+
+	options := []llms.CallOption{llms.WithThinkingMode(langChainThinkingMode(thinking.Effort))}
+	if thinking.MaxCompletionTokens > 0 {
+		options = append(options, lcopenai.WithMaxCompletionTokens(thinking.MaxCompletionTokens))
+	}
+	return options
+}
+
+func langChainThinkingMode(effort string) llms.ThinkingMode {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return llms.ThinkingModeLow
+	case "medium":
+		return llms.ThinkingModeMedium
+	case "high", "":
+		return llms.ThinkingModeHigh
+	default:
+		return llms.ThinkingModeHigh
+	}
+}
+
 func NewLangChainTools(ctx ToolContext) []lctools.Tool {
 	tools := []lctools.Tool{
 		langChainTool{

@@ -9,9 +9,16 @@ import (
 	"strings"
 )
 
-const MaxFileSize = 30 * 1024 * 1024 // 30MB
+const (
+	MaxUploadFileSize = 200 * 1024 * 1024 // 200MB
+	MaxUnzippedSize   = 500 * 1024 * 1024 // 500MB
+)
 
 func Unzip(src, dest string) error {
+	return unzipWithLimit(src, dest, MaxUnzippedSize)
+}
+
+func unzipWithLimit(src, dest string, maxTotalSize int64) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -53,8 +60,8 @@ func Unzip(src, dest string) error {
 		}
 
 		totalSize += written
-		if totalSize > MaxFileSize {
-			return fmt.Errorf("unzipped size exceeds 30MB")
+		if totalSize > maxTotalSize {
+			return fmt.Errorf("unzipped size exceeds %dMB", maxTotalSize/(1024*1024))
 		}
 	}
 	return nil

@@ -64,6 +64,9 @@ func newScanSession(task *model.Task, stage, prompt string, reset bool) (*scanSe
 	if session.state.Microcompact.ClearedMessages == nil {
 		session.state.Microcompact.ClearedMessages = map[string]microcompactRecord{}
 	}
+	if err := session.reconcileActiveBoundary(); err != nil {
+		return nil, err
+	}
 
 	return session, nil
 }
@@ -95,6 +98,9 @@ func loadScanSession(task *model.Task, stage, prompt string) (*scanSession, erro
 	}
 	if session.state.Microcompact.ClearedMessages == nil {
 		session.state.Microcompact.ClearedMessages = map[string]microcompactRecord{}
+	}
+	if err := session.reconcileActiveBoundary(); err != nil {
+		return nil, err
 	}
 	return session, nil
 }
@@ -230,13 +236,14 @@ func (s *scanSession) appendSynthetic(role, kind, content string, boundary *comp
 func (s *scanSession) appendChatMessage(msg openai.ChatCompletionMessage) error {
 	parentID := s.state.LastMessageID
 	tmsg := transcriptMessage{
-		ID:         s.nextMessageID(),
-		ParentID:   parentID,
-		Role:       msg.Role,
-		Kind:       runtimeKindNormal,
-		Content:    msg.Content,
-		ToolCallID: msg.ToolCallID,
-		CreatedAt:  time.Now(),
+		ID:               s.nextMessageID(),
+		ParentID:         parentID,
+		Role:             msg.Role,
+		Kind:             runtimeKindNormal,
+		Content:          msg.Content,
+		ReasoningContent: msg.ReasoningContent,
+		ToolCallID:       msg.ToolCallID,
+		CreatedAt:        time.Now(),
 	}
 	if len(msg.ToolCalls) > 0 {
 		tmsg.ToolCalls = make([]runtimeToolCall, 0, len(msg.ToolCalls))
@@ -282,6 +289,25 @@ func (s *scanSession) messageIndex(id string) int {
 	return -1
 }
 
+func (s *scanSession) reconcileActiveBoundary() error {
+	if s.state.ActiveBoundaryID != "" && s.messageIndex(s.state.ActiveBoundaryID) >= 0 {
+		return nil
+	}
+
+	activeBoundaryID := ""
+	for i := len(s.transcript) - 1; i >= 0; i-- {
+		if s.transcript[i].Kind == runtimeKindCompactBoundary {
+			activeBoundaryID = s.transcript[i].ID
+			break
+		}
+	}
+	if s.state.ActiveBoundaryID == activeBoundaryID {
+		return nil
+	}
+	s.state.ActiveBoundaryID = activeBoundaryID
+	return s.saveState()
+}
+
 func (s *scanSession) activeMessages() []transcriptMessage {
 	if s.state.ActiveBoundaryID == "" {
 		return append([]transcriptMessage(nil), s.transcript...)
@@ -293,14 +319,27 @@ func (s *scanSession) activeMessages() []transcriptMessage {
 
 	active := make([]transcriptMessage, 0, len(s.transcript)-boundaryIdx)
 	boundary := s.transcript[boundaryIdx]
+	preserved := []transcriptMessage{}
 	if boundary.Boundary != nil && boundary.Boundary.HeadID != "" && boundary.Boundary.TailID != "" {
 		headIdx := s.messageIndex(boundary.Boundary.HeadID)
 		tailIdx := s.messageIndex(boundary.Boundary.TailID)
 		if headIdx >= 0 && tailIdx >= headIdx {
-			active = append(active, s.transcript[headIdx:tailIdx+1]...)
+			preserved = append(preserved, s.transcript[headIdx:tailIdx+1]...)
 		}
 	}
-	active = append(active, s.transcript[boundaryIdx+1:]...)
+
+	postBoundary := s.transcript[boundaryIdx+1:]
+	if len(preserved) == 0 {
+		active = append(active, postBoundary...)
+		return active
+	}
+	insertAt := 0
+	for insertAt < len(postBoundary) && postBoundary[insertAt].Kind == runtimeKindCompactSummary {
+		insertAt++
+	}
+	active = append(active, postBoundary[:insertAt]...)
+	active = append(active, preserved...)
+	active = append(active, postBoundary[insertAt:]...)
 	return active
 }
 
@@ -350,9 +389,10 @@ func (s *scanSession) toChatMessage(msg transcriptMessage) (openai.ChatCompletio
 	}
 
 	out := openai.ChatCompletionMessage{
-		Role:       msg.Role,
-		Content:    content,
-		ToolCallID: msg.ToolCallID,
+		Role:             msg.Role,
+		Content:          content,
+		ReasoningContent: msg.ReasoningContent,
+		ToolCallID:       msg.ToolCallID,
 	}
 	if len(msg.ToolCalls) > 0 {
 		out.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
@@ -557,7 +597,7 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return fmt.Errorf("write temp file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := replaceFile(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp file: %w", err)
 	}
