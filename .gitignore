@@ -2,6 +2,7 @@
 /.cache/
 /bin/
 /release/
+/releases/
 /tmp/
 /temp/
 /coverage/
