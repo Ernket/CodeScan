@@ -103,6 +103,58 @@ func resultWithProcessingError(rawOutput string, message string) string {
 	return rawOutput + "\n\n[" + message + "]"
 }
 
+type processingDiagnosticsProvider interface {
+	ProcessingDiagnostics() string
+	ProcessingLogPreview() string
+}
+
+func resultWithProcessingDiagnostics(result string, err error) string {
+	provider, ok := err.(processingDiagnosticsProvider)
+	if !ok {
+		return result
+	}
+	diagnostics := strings.TrimSpace(provider.ProcessingDiagnostics())
+	if diagnostics == "" {
+		return result
+	}
+	if strings.TrimSpace(result) == "" {
+		return diagnostics
+	}
+	return strings.TrimSpace(result) + "\n\n" + diagnostics
+}
+
+func processingErrorLogMessage(message string, err error) string {
+	provider, ok := err.(processingDiagnosticsProvider)
+	if !ok {
+		return message
+	}
+	preview := strings.TrimSpace(provider.ProcessingLogPreview())
+	if preview == "" {
+		return message
+	}
+	return message + " (" + preview + ")"
+}
+
+func previewForLog(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
+}
+
+func abnormalMainFinishReason(reason openai.FinishReason) bool {
+	switch reason {
+	case "", openai.FinishReasonStop, openai.FinishReasonToolCalls:
+		return false
+	default:
+		return true
+	}
+}
+
 func extractJSON(input string) string {
 	input = strings.TrimSpace(input)
 	if json.Valid([]byte(input)) {
@@ -1962,20 +2014,17 @@ Output Format:
 - **Iterative Workflow**:
   1. **Think**: Briefly explain your analysis of the current state.
   2. **Act**: Call the appropriate tool.
-  3. **Loop**: Review the tool output and repeat. Do not plan too far ahead; adapt to what you find.
-- **Final Output**: When finished, output the result as a strict JSON array wrapped in a Markdown code block.
-  
-  Example Final Output (FORMAT ONLY - Real output must contain ALL findings):
-  `+"```json"+`
-  [
-    {"method": "GET", "path": "/api/users", "source": "routes/user.go", "description": "Get all users"},
-    {"method": "POST", "path": "/api/login", "source": "routes/auth.go", "description": "User login"},
-    ... (and all other routes found)
-  ]
-  `+"```"+`
-
-  - The JSON array must contain objects with: "method", "path", "source" (relative path), "description".
-  - **CRITICAL**: Do NOT include any text outside the JSON block in your final response.
+  3. **Submit**: Whenever you confirm routes, call submit_routes with a batch of 1-20 route objects.
+  4. **Loop**: Review the tool output and repeat. Do not plan too far ahead; adapt to what you find.
+- **Route Submission Format**:
+  - Each submit_routes route object MUST contain: "method", "path", "source" (relative path), "description".
+  - Keep "description" short: one sentence, no code snippets, no duplicated file content.
+  - Submit routes incrementally as they are confirmed. Do not wait until the end to submit all routes.
+  - If a route has multiple methods, submit one route object per method unless the framework explicitly defines ANY.
+- **Final Output**:
+  - When finished and all route candidate files and framework-specific searches are exhausted, output exactly:
+    ROUTE_DISCOVERY_COMPLETE
+  - **CRITICAL**: Do NOT output the full route JSON array in the final response. The backend persists submitted routes.
 `, task.BasePath)
 	} else if stage == "rce" {
 		// Load previous stage result (Route Map)
@@ -2720,6 +2769,7 @@ Base Path: %s
 	prompt = appendChineseNarrativeRules(prompt, stage)
 	prompt = promptArtifactGuidance(prompt)
 	prompt = appendStructuredQueryGuidance(prompt, stage)
+	prompt = appendSubmissionWorkflowGuidance(prompt, stage, kind)
 
 	var session *scanSession
 	var err error
@@ -2778,6 +2828,7 @@ Base Path: %s
 	failRunWithRawOutput := func(prefix string, runErr error, rawOutput string) {
 		message := prefix + runErr.Error()
 		result := resultWithProcessingError(rawOutput, message)
+		result = resultWithProcessingDiagnostics(result, runErr)
 		task.Result = result
 		if options.ManageTaskStatus {
 			task.Status = "failed"
@@ -2789,7 +2840,7 @@ Base Path: %s
 			saveTaskStageRecord(currentStage)
 		}
 		_ = session.markStatus(runtimeStatusFailed)
-		logFunc(message)
+		logFunc(processingErrorLogMessage(message, runErr))
 	}
 
 	// Chat Loop
@@ -2943,7 +2994,7 @@ Base Path: %s
 		resp, callErr = createChatCompletionWithRetry(ctx, client, prepareChatCompletionRequest(openai.ChatCompletionRequest{
 			Model:    executionProfile.Model,
 			Messages: messages,
-			Tools:    Tools,
+			Tools:    toolsForRunKind(stage, kind),
 		}, chatCompletionPurposeMainScan), chatCompletionRetryHooks{
 			onRetry: func(attempt, maxAttempts int, attemptTimeout, nextTimeout, retryDelay time.Duration, err error, timeoutLike bool) {
 				if timeoutLike {
@@ -3009,7 +3060,23 @@ Base Path: %s
 			usageUnavailableLogged = true
 		}
 
-		msg, toolCallStats := normalizeToolCallMessage(resp.Choices[0].Message)
+		if len(resp.Choices) == 0 {
+			failRun("AI Error: ", fmt.Errorf("AI response did not include any choices"))
+			return
+		}
+		choice := resp.Choices[0]
+		if abnormalMainFinishReason(choice.FinishReason) {
+			finishErr := fmt.Errorf("model output ended abnormally with finish_reason=%q; output may be truncated or filtered", choice.FinishReason)
+			finishErr = appendSubmittedProgressToError(task, stage, kind, finishErr)
+			failRunWithRawOutput(
+				"Result processing error: ",
+				finishErr,
+				choice.Message.Content,
+			)
+			return
+		}
+
+		msg, toolCallStats := normalizeToolCallMessage(choice.Message)
 		if summary := toolCallStats.summary("Normalized assistant tool calls before persistence"); summary != "" {
 			logFunc(summary)
 		}
@@ -3056,6 +3123,7 @@ Base Path: %s
 			currentStage: currentStage,
 			session:      session,
 			toolCache:    toolCache,
+			kind:         kind,
 		}, msg.ToolCalls, logFunc)
 		if toolErr != nil {
 			failRun("Runtime error: ", toolErr)

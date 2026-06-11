@@ -167,6 +167,57 @@ func TestCompletedRunDoesNotRestartController(t *testing.T) {
 	}
 }
 
+func TestValidatorFailureDoesNotReleasePersistence(t *testing.T) {
+	setupOrchestrationServiceTestDB(t)
+	restoreConfig := setServiceTestConfig(t)
+	defer restoreConfig()
+
+	manager := NewManager()
+	task, run := createTestTaskAndRun(t, "task-validator-failure", runStatusRunning)
+	stage := model.TaskStage{
+		TaskID:     task.ID,
+		Name:       "auth",
+		Status:     "running",
+		OutputJSON: []byte(`[{"type":"Authentication","affected_endpoints":[],"description":"finding"}]`),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	subtask := buildStageSubtask(run.ID, task.ID, "auth", true)
+	subtask.Status = subtaskStatusRunning
+	subtask.WorkerStatus = roleStatusCompleted
+	subtask.IntegratorStatus = roleStatusCompleted
+	subtask.ValidatorStatus = roleStatusRunning
+	subtask.PersistenceStatus = roleStatusPending
+	mustCreateRecords(t, &task, &run, &stage, &subtask)
+
+	validatorAgent := mustCreateRunningAgentRun(t, manager, task.ID, run.ID, subtask.ID, roleValidator, subtask.Stage)
+	manager.failAgent(
+		&run,
+		&task,
+		&subtask,
+		validatorAgent.ID,
+		"Revalidation incomplete: 1 existing findings, 0 reviewed, 1 unreviewed.",
+		scanner.StageRunRevalidate,
+	)
+
+	storedSubtask := loadSubtaskForTest(t, subtask.ID)
+	if storedSubtask.Status != subtaskStatusFailed {
+		t.Fatalf("expected failed subtask after validator failure, got %s", storedSubtask.Status)
+	}
+	if storedSubtask.ValidatorStatus != roleStatusFailed {
+		t.Fatalf("expected failed validator status, got %s", storedSubtask.ValidatorStatus)
+	}
+	if storedSubtask.PersistenceStatus == roleStatusReady {
+		t.Fatalf("expected persistence not to be released after validator failure")
+	}
+	if storedSubtask.PersistenceStatus != roleStatusPending {
+		t.Fatalf("expected persistence to remain pending, got %s", storedSubtask.PersistenceStatus)
+	}
+	if !strings.Contains(storedSubtask.ErrorMessage, "Revalidation incomplete") {
+		t.Fatalf("expected revalidation error on subtask, got %q", storedSubtask.ErrorMessage)
+	}
+}
+
 func TestDispatchRoleMarksFailedWhenStartAgentRunErrors(t *testing.T) {
 	testCases := []struct {
 		name               string

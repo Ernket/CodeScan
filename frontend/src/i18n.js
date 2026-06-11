@@ -140,6 +140,10 @@ export const messages = {
       loadingProjectSummaries: '正在加载项目摘要...',
       noProjectsYet: '还没有项目，上传代码压缩包后即可开始首次全阶段审计。',
       organization: '\u7ec4\u7ec7',
+      organizationScope: '\u7ec4\u7ec7\u8303\u56f4',
+      allVisibleOrganizations: '\u5168\u90e8\u53ef\u89c1\u7ec4\u7ec7',
+      organizationScopeSummary: '\u5f53\u524d\u8303\u56f4\u5185 {count} \u4e2a\u9879\u76ee',
+      organizationGroupSummary: '{count} \u4e2a\u9879\u76ee / {running} \u4e2a\u8fd0\u884c\u4e2d',
     },
     taskDetail: {
       selectRerunStages: '\u9009\u62e9\u91cd\u8dd1\u9636\u6bb5',
@@ -743,6 +747,10 @@ export const messages = {
       loadingProjectSummaries: 'Loading project summaries...',
       noProjectsYet: 'No projects yet. Upload a code archive to start the first full audit pipeline.',
       organization: 'Organization',
+      organizationScope: 'Organization Scope',
+      allVisibleOrganizations: 'All Visible Organizations',
+      organizationScopeSummary: '{count} projects in the current scope',
+      organizationGroupSummary: '{count} projects / {running} running',
     },
     taskDetail: {
       selectRerunStages: 'Select Stages to Rerun',

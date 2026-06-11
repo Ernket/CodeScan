@@ -149,6 +149,107 @@ var Tools = []openai.Tool{
 	{
 		Type: openai.ToolTypeFunction,
 		Function: &openai.FunctionDefinition{
+			Name:        "submit_routes",
+			Description: "Submit a batch of discovered API routes during the init route discovery stage. Use this instead of returning a large final route JSON array.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"routes": {
+						Type:        jsonschema.Array,
+						Description: "One to twenty discovered routes. Each route must include method, path, source, and description.",
+						Items: &jsonschema.Definition{
+							Type: jsonschema.Object,
+							Properties: map[string]jsonschema.Definition{
+								"method": {
+									Type:        jsonschema.String,
+									Description: "HTTP method such as GET, POST, PUT, DELETE, PATCH, ANY, or STATIC.",
+								},
+								"path": {
+									Type:        jsonschema.String,
+									Description: "Route path or URL pattern exactly as discovered.",
+								},
+								"source": {
+									Type:        jsonschema.String,
+									Description: "Relative source file path for the route.",
+								},
+								"description": {
+									Type:        jsonschema.String,
+									Description: "Short route description, one sentence.",
+								},
+							},
+							Required: []string{"method", "path", "source", "description"},
+						},
+					},
+				},
+				Required: []string{"routes"},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name:        "submit_findings",
+			Description: "Submit a small batch of confirmed vulnerability findings for the current non-init audit stage. Use this instead of returning a large final findings JSON array.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"findings": {
+						Type:        jsonschema.Array,
+						Description: "One to five complete finding objects that match the current stage schema.",
+						Items: &jsonschema.Definition{
+							Type:                 jsonschema.Object,
+							Description:          "A complete finding object for the current stage schema.",
+							AdditionalProperties: true,
+						},
+					},
+				},
+				Required: []string{"findings"},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name:        "submit_reviews",
+			Description: "Submit a batch of revalidation review conclusions for existing findings. Use this instead of returning a large final review JSON array.",
+			Parameters: jsonschema.Definition{
+				Type: jsonschema.Object,
+				Properties: map[string]jsonschema.Definition{
+					"reviews": {
+						Type:        jsonschema.Array,
+						Description: "One to twenty review objects for existing finding indexes.",
+						Items: &jsonschema.Definition{
+							Type: jsonschema.Object,
+							Properties: map[string]jsonschema.Definition{
+								"finding_index": {
+									Type:        jsonschema.Integer,
+									Description: "Zero-based index of the existing finding being reviewed.",
+								},
+								"verification_status": {
+									Type:        jsonschema.String,
+									Description: "confirmed, uncertain, or rejected.",
+									Enum:        []string{"confirmed", "uncertain", "rejected"},
+								},
+								"reviewed_severity": {
+									Type:        jsonschema.String,
+									Description: "Normalized reviewed severity.",
+								},
+								"verification_reason": {
+									Type:        jsonschema.String,
+									Description: "Concise evidence-based review reason.",
+								},
+							},
+							Required: []string{"finding_index", "verification_status", "reviewed_severity", "verification_reason"},
+						},
+					},
+				},
+				Required: []string{"reviews"},
+			},
+		},
+	},
+	{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
 			Name:        "query_stage_output",
 			Description: "Query structured findings from the current stage or another completed stage without injecting the full findings JSON into the prompt.",
 			Parameters: jsonschema.Definition{
@@ -294,6 +395,37 @@ var Tools = []openai.Tool{
 			},
 		},
 	},
+}
+
+func toolsForRunKind(stage string, kind StageRunKind) []openai.Tool {
+	kind = normalizeStageRunKind(string(kind))
+	out := make([]openai.Tool, 0, len(Tools))
+	for _, tool := range Tools {
+		if tool.Function == nil {
+			out = append(out, tool)
+			continue
+		}
+		switch tool.Function.Name {
+		case "submit_routes":
+			if stage != "init" {
+				continue
+			}
+		case "submit_findings":
+			if stage == "init" || kind == StageRunRevalidate {
+				continue
+			}
+		case "submit_reviews":
+			if stage == "init" || kind != StageRunRevalidate {
+				continue
+			}
+		}
+		out = append(out, tool)
+	}
+	return out
+}
+
+func toolsForStage(stage string) []openai.Tool {
+	return toolsForRunKind(stage, StageRunInitial)
 }
 
 const (

@@ -443,12 +443,14 @@ func ExecuteQueryStageOutput(task *model.Task, currentStage *model.TaskStage, st
 	origin = strings.ToLower(strings.TrimSpace(origin))
 	verificationStatus = strings.ToLower(strings.TrimSpace(verificationStatus))
 	filtered := make([]map[string]any, 0, len(findings))
-	for _, finding := range findings {
+	for index, finding := range findings {
+		indexedFinding := cloneFinding(finding)
+		indexedFinding["finding_index"] = index
 		findingOrigin := strings.ToLower(strings.TrimSpace(summarysvc.ExtractString(finding["origin"])))
 		if findingOrigin == "" {
 			findingOrigin = "initial"
 		}
-		status := summarysvc.FindingVerificationStatus(finding)
+		status := summarysvc.FindingVerificationStatus(indexedFinding)
 
 		if origin != "" && findingOrigin != origin {
 			continue
@@ -456,7 +458,7 @@ func ExecuteQueryStageOutput(task *model.Task, currentStage *model.TaskStage, st
 		if verificationStatus != "" && status != verificationStatus {
 			continue
 		}
-		filtered = append(filtered, finding)
+		filtered = append(filtered, indexedFinding)
 	}
 
 	payload := map[string]any{
@@ -531,6 +533,7 @@ func BuildCurrentFindingsContext(stage string, findings []map[string]any) string
 	lines := []string{
 		fmt.Sprintf("Current %s findings summary:", summarysvc.StageLabel(stage)),
 		fmt.Sprintf("- total_findings: %d", len(findings)),
+		"- finding_index: zero-based current stage output index returned by query_stage_output",
 		"- origin_distribution:",
 	}
 	for _, key := range sortedCountKeys(originCounts) {
@@ -540,7 +543,7 @@ func BuildCurrentFindingsContext(stage string, findings []map[string]any) string
 	for _, key := range sortedCountKeys(statusCounts) {
 		lines = append(lines, fmt.Sprintf("  - %s: %d", key, statusCounts[key]))
 	}
-	lines = append(lines, fmt.Sprintf(`- query_stage_output: query_stage_output({"stage":"%s","origin":"gap_check","verification_status":"confirmed","offset":0,"limit":20})`, stage))
+	lines = append(lines, fmt.Sprintf(`- query_stage_output: query_stage_output({"stage":"%s","offset":0,"limit":20})`, stage))
 	return strings.Join(lines, "\n")
 }
 

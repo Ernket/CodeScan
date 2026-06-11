@@ -3,6 +3,8 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -109,6 +111,23 @@ func scopedReadableTasksQuery(c *gin.Context, db *gorm.DB) (*gorm.DB, bool) {
 	if !ok {
 		return nil, false
 	}
+	if organizationID, filtered, ok := parseTaskOrganizationFilter(c); !ok {
+		return nil, false
+	} else if filtered {
+		ids, err := orgsvc.ReadableOrganizationSubtreeIDs(database.DB, user, organizationID)
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, orgsvc.ErrOrganizationInaccessible):
+			c.JSON(http.StatusNotFound, gin.H{"error": "Organization not found"})
+			return nil, false
+		case err != nil:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to inspect organization permissions"})
+			return nil, false
+		case len(ids) == 0:
+			return db.Where("1 = 0"), true
+		default:
+			return db.Where("organization_id IN ?", ids), true
+		}
+	}
 	if orgsvc.IsSuperAdmin(user) {
 		return db, true
 	}
@@ -121,6 +140,19 @@ func scopedReadableTasksQuery(c *gin.Context, db *gorm.DB) (*gorm.DB, bool) {
 		return db.Where("1 = 0"), true
 	}
 	return db.Where("organization_id IN ?", ids), true
+}
+
+func parseTaskOrganizationFilter(c *gin.Context) (uint, bool, bool) {
+	raw := strings.TrimSpace(c.Query("organization_id"))
+	if raw == "" {
+		return 0, false, true
+	}
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid organization id"})
+		return 0, false, false
+	}
+	return uint(id), true, true
 }
 
 func attachTaskPermissions(c *gin.Context, tasks []model.Task) bool {

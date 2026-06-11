@@ -61,6 +61,7 @@ const selectedTaskId = ref('')
 const tasks = ref([])
 const stats = ref(createEmptyStats())
 const accessibleOrganizations = ref([])
+const selectedOrganizationId = ref('')
 const showUploadModal = ref(false)
 const showPasswordModal = ref(false)
 const rerunModalOpen = ref(false)
@@ -1018,6 +1019,7 @@ const logout = () => {
   resetPasswordForm()
   tasks.value = []
   accessibleOrganizations.value = []
+  selectedOrganizationId.value = ''
   uploadForm.value = { name: '', remark: '', file: null, organization_id: '' }
   stats.value = createEmptyStats()
   displayStats.value = { projects: 0, interfaces: 0, vulns: 0, completed_audits: 0 }
@@ -1044,15 +1046,21 @@ const fetchData = async () => {
 
   isLoading.value = true
   try {
-    const [statsRes, tasksRes, organizationsRes] = await Promise.all([
-      axios.get(`${API_URL}/stats`, authConfig()),
-      axios.get(`${API_URL}/tasks`, authConfig()),
-      axios.get(`${API_URL}/organizations/accessible`, authConfig())
+    const organizationsRes = await axios.get(`${API_URL}/organizations/accessible`, authConfig())
+    accessibleOrganizations.value = Array.isArray(organizationsRes.data) ? organizationsRes.data : []
+
+    if (selectedOrganizationId.value && !flatOrganizations.value.some(organization => String(organization.id) === String(selectedOrganizationId.value))) {
+      selectedOrganizationId.value = ''
+    }
+
+    const filterParams = selectedOrganizationId.value ? { organization_id: selectedOrganizationId.value } : {}
+    const [statsRes, tasksRes] = await Promise.all([
+      axios.get(`${API_URL}/stats`, { ...authConfig(), params: filterParams }),
+      axios.get(`${API_URL}/tasks`, { ...authConfig(), params: filterParams }),
     ])
 
     stats.value = normalizeStatsResponse(statsRes.data)
     tasks.value = Array.isArray(tasksRes.data) ? tasksRes.data : []
-    accessibleOrganizations.value = Array.isArray(organizationsRes.data) ? organizationsRes.data : []
 
     if (selectedTaskId.value) {
       const summary = tasks.value.find(task => task.id === selectedTaskId.value)
@@ -1073,6 +1081,13 @@ const fetchData = async () => {
   }
 }
 
+const selectDashboardOrganization = async (organizationId) => {
+  const nextID = organizationId ? String(organizationId) : ''
+  if (selectedOrganizationId.value === nextID) return
+  selectedOrganizationId.value = nextID
+  await fetchData()
+}
+
 const handleFileUpload = (event) => {
   uploadForm.value.file = event.target.files[0]
 }
@@ -1080,7 +1095,8 @@ const handleFileUpload = (event) => {
 const openUploadModal = () => {
   if (!canCreateProject.value) return
   if (!uploadForm.value.organization_id && writableOrganizations.value.length > 0) {
-    uploadForm.value.organization_id = String(writableOrganizations.value[0].id)
+    const selectedWritableOrganization = writableOrganizations.value.find(organization => String(organization.id) === String(selectedOrganizationId.value))
+    uploadForm.value.organization_id = String((selectedWritableOrganization || writableOrganizations.value[0]).id)
   }
   showUploadModal.value = true
 }
@@ -1412,13 +1428,16 @@ onBeforeUnmount(() => {
               :stats="stats"
               :display-stats="displayStats"
               :tasks="tasks"
+              :organizations="flatOrganizations"
               :stage-definitions="stageDefinitions"
               :loading="isLoading"
               :selected-task-id="selectedTaskId"
+              :selected-organization-id="selectedOrganizationId"
               :locale="locale"
               :t="t"
               :can-delete="canDelete"
               @refresh="fetchData"
+              @select-organization="selectDashboardOrganization"
               @open-task="openTask"
               @delete-task="deleteTask"
             />

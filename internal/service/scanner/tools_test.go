@@ -7,7 +7,52 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sashabaranov/go-openai"
 )
+
+func TestToolsForStageOnlyExposesSubmitRoutesForInit(t *testing.T) {
+	if !toolListContains(toolsForStage("init"), "submit_routes") {
+		t.Fatal("expected init stage tools to include submit_routes")
+	}
+	if toolListContains(toolsForStage("auth"), "submit_routes") {
+		t.Fatal("expected non-init stage tools to hide submit_routes")
+	}
+}
+
+func TestToolsForRunKindExposesStableSubmissionToolsByStageAndKind(t *testing.T) {
+	initTools := toolsForRunKind("init", StageRunInitial)
+	if !toolListContains(initTools, "submit_routes") {
+		t.Fatal("expected init initial tools to include submit_routes")
+	}
+	if toolListContains(initTools, "submit_findings") || toolListContains(initTools, "submit_reviews") {
+		t.Fatal("expected init tools to hide vulnerability submission tools")
+	}
+
+	initialTools := toolsForRunKind("auth", StageRunInitial)
+	if !toolListContains(initialTools, "submit_findings") {
+		t.Fatal("expected auth initial tools to include submit_findings")
+	}
+	if toolListContains(initialTools, "submit_routes") || toolListContains(initialTools, "submit_reviews") {
+		t.Fatal("expected auth initial tools to hide submit_routes and submit_reviews")
+	}
+
+	gapCheckTools := toolsForRunKind("auth", StageRunGapCheck)
+	if !toolListContains(gapCheckTools, "submit_findings") {
+		t.Fatal("expected auth gap-check tools to include submit_findings")
+	}
+	if toolListContains(gapCheckTools, "submit_routes") || toolListContains(gapCheckTools, "submit_reviews") {
+		t.Fatal("expected auth gap-check tools to hide submit_routes and submit_reviews")
+	}
+
+	revalidateTools := toolsForRunKind("auth", StageRunRevalidate)
+	if !toolListContains(revalidateTools, "submit_reviews") {
+		t.Fatal("expected auth revalidate tools to include submit_reviews")
+	}
+	if toolListContains(revalidateTools, "submit_routes") || toolListContains(revalidateTools, "submit_findings") {
+		t.Fatal("expected auth revalidate tools to hide submit_routes and submit_findings")
+	}
+}
 
 func TestExecuteListFilesSkipsIgnoredDirectories(t *testing.T) {
 	root := t.TempDir()
@@ -23,6 +68,15 @@ func TestExecuteListFilesSkipsIgnoredDirectories(t *testing.T) {
 	if !strings.Contains(result, "[D] src") {
 		t.Fatalf("expected non-ignored directory to remain visible, got %q", result)
 	}
+}
+
+func toolListContains(tools []openai.Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Function != nil && tool.Function.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRecursiveToolsSkipIgnoredDirectories(t *testing.T) {

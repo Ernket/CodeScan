@@ -214,6 +214,39 @@ func ReadableOrganizationIDs(db *gorm.DB, user model.User) ([]uint, error) {
 	return ids, nil
 }
 
+func ReadableOrganizationSubtreeIDs(db *gorm.DB, user model.User, organizationID uint) ([]uint, error) {
+	orgs, roles, err := effectiveOrganizationRoles(db, user)
+	if err != nil {
+		return nil, err
+	}
+
+	var selected *model.Organization
+	for i := range orgs {
+		if orgs[i].ID == organizationID {
+			selected = &orgs[i]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	if !IsSuperAdmin(user) && roles[organizationID] == "" {
+		return nil, ErrOrganizationInaccessible
+	}
+
+	ids := make([]uint, 0)
+	for _, org := range orgs {
+		if selected.Path == "" || org.Path == "" || !strings.HasPrefix(org.Path, selected.Path) {
+			continue
+		}
+		if IsSuperAdmin(user) || roles[org.ID] != "" {
+			ids = append(ids, org.ID)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
 func WritableOrganizationIDs(db *gorm.DB, user model.User) ([]uint, error) {
 	if IsSuperAdmin(user) {
 		return nil, nil

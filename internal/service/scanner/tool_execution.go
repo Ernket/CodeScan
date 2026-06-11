@@ -158,6 +158,7 @@ type toolPlanningContext struct {
 	currentStage *model.TaskStage
 	session      *scanSession
 	toolCache    *toolResultCache
+	kind         StageRunKind
 }
 
 func executeToolRound(
@@ -550,6 +551,94 @@ func buildToolCallPlan(planCtx toolPlanningContext, toolCall openai.ToolCall) pl
 			toolName: plan.toolName,
 			execute: func() string {
 				return ExecuteQueryRoutes(planCtx.task, source, pathFilter, method, offset, limit)
+			},
+		}
+
+	case "submit_routes":
+		if planCtx.session == nil || planCtx.session.stage != "init" {
+			plan.immediateResult = "Error: submit_routes is only available during the init route discovery stage."
+			return plan
+		}
+		rawRoutes, ok := args["routes"].([]any)
+		if !ok {
+			plan.immediateResult = "Error: routes must be a JSON array."
+			return plan
+		}
+		plan.execution = &sharedToolExecution{
+			toolName: plan.toolName,
+			execute: func() string {
+				submitted, total, err := planCtx.session.appendSubmittedRoutes(rawRoutes)
+				if err != nil {
+					return fmt.Sprintf("Error: %v", err)
+				}
+				return fmt.Sprintf(
+					"Submitted %d new route(s). Total collected routes: %d. Continue scanning until all route candidate files and framework-specific patterns have been exhausted.",
+					submitted,
+					total,
+				)
+			},
+		}
+
+	case "submit_findings":
+		if planCtx.session == nil || planCtx.session.stage == "init" {
+			plan.immediateResult = "Error: submit_findings is only available during non-init vulnerability stages."
+			return plan
+		}
+		if normalizeStageRunKind(string(planCtx.kind)) == StageRunRevalidate {
+			plan.immediateResult = "Error: submit_findings is not available during revalidation. Use submit_reviews instead."
+			return plan
+		}
+		rawFindings, ok := args["findings"].([]any)
+		if !ok {
+			plan.immediateResult = "Error: findings must be a JSON array."
+			return plan
+		}
+		plan.execution = &sharedToolExecution{
+			toolName: plan.toolName,
+			execute: func() string {
+				submitted, total, err := planCtx.session.appendSubmittedFindings(rawFindings)
+				if err != nil {
+					return fmt.Sprintf("Error: %v", err)
+				}
+				return fmt.Sprintf(
+					"Submitted %d new finding(s). Total collected findings for this stage: %d. Continue auditing until the stage scope is exhausted.",
+					submitted,
+					total,
+				)
+			},
+		}
+
+	case "submit_reviews":
+		if planCtx.session == nil || planCtx.session.stage == "init" {
+			plan.immediateResult = "Error: submit_reviews is only available during non-init revalidation stages."
+			return plan
+		}
+		if normalizeStageRunKind(string(planCtx.kind)) != StageRunRevalidate {
+			plan.immediateResult = "Error: submit_reviews is only available during revalidation."
+			return plan
+		}
+		rawReviews, ok := args["reviews"].([]any)
+		if !ok {
+			plan.immediateResult = "Error: reviews must be a JSON array."
+			return plan
+		}
+		plan.execution = &sharedToolExecution{
+			toolName: plan.toolName,
+			execute: func() string {
+				existing, err := currentJSONArrayForRun(planCtx.task, planCtx.currentStage, planCtx.session.stage)
+				if err != nil {
+					return fmt.Sprintf("Error: %v", err)
+				}
+				submitted, total, err := planCtx.session.appendSubmittedReviews(rawReviews, existing)
+				if err != nil {
+					return fmt.Sprintf("Error: %v", err)
+				}
+				return fmt.Sprintf(
+					"Submitted %d new review(s). Total collected reviews for this stage: %d of %d. Continue until every current finding has a review.",
+					submitted,
+					total,
+					len(existing),
+				)
 			},
 		}
 

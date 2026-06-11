@@ -3,7 +3,6 @@ package database
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"os"
 	"strings"
 
@@ -51,9 +50,11 @@ func EnsureDefaultSuperAdmin(db *gorm.DB) (DefaultSuperAdminResult, error) {
 	}
 
 	var user model.User
-	err = db.Where("username = ?", defaultAdminUsername).First(&user).Error
-	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound):
+	query := db.Where("username = ?", defaultAdminUsername).Limit(1).Find(&user)
+	if query.Error != nil {
+		return result, query.Error
+	}
+	if query.RowsAffected == 0 {
 		user = model.User{
 			Username:     defaultAdminUsername,
 			PasswordHash: hash,
@@ -65,9 +66,7 @@ func EnsureDefaultSuperAdmin(db *gorm.DB) (DefaultSuperAdminResult, error) {
 			return result, err
 		}
 		result.Created = true
-	case err != nil:
-		return result, err
-	default:
+	} else {
 		updates := map[string]any{
 			"password_hash": hash,
 			"role":          model.RoleSuperAdmin,

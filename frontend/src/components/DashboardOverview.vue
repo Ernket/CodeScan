@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import {
   Activity,
+  Building2,
   CheckCircle,
   ChevronRight,
   FileCode,
@@ -10,7 +11,6 @@ import {
   Server,
   ShieldAlert,
   Trash2,
-  Zap,
 } from 'lucide-vue-next'
 
 const props = defineProps({
@@ -26,6 +26,10 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  organizations: {
+    type: Array,
+    default: () => [],
+  },
   stageDefinitions: {
     type: Array,
     default: () => [],
@@ -35,6 +39,10 @@ const props = defineProps({
     default: false,
   },
   selectedTaskId: {
+    type: String,
+    default: '',
+  },
+  selectedOrganizationId: {
     type: String,
     default: '',
   },
@@ -52,7 +60,7 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['refresh', 'open-task', 'delete-task'])
+const emit = defineEmits(['refresh', 'select-organization', 'open-task', 'delete-task'])
 
 const statCards = computed(() => {
   const runningCount = props.tasks.filter(task => task.status === 'running').length
@@ -142,6 +150,76 @@ const coverageItems = computed(() => {
     }
   })
 })
+
+const organizationById = computed(() => {
+  return new Map(props.organizations.map(organization => [String(organization.id), organization]))
+})
+
+const selectedOrganization = computed(() => {
+  if (!props.selectedOrganizationId) return null
+  return organizationById.value.get(String(props.selectedOrganizationId)) || null
+})
+
+const organizationFilterOptions = computed(() => [
+  {
+    id: '',
+    label: props.t('dashboard.allVisibleOrganizations'),
+    depth: 0,
+    count: props.tasks.length,
+  },
+  ...props.organizations.map(organization => ({
+    id: String(organization.id),
+    label: organization.name,
+    displayName: organization.displayName || organization.name,
+    depth: organization.treeDepth ?? organization.depth ?? 0,
+    count: props.tasks.filter(task => taskBelongsToOrganizationScope(task, organization)).length,
+  })),
+])
+
+const selectedOrganizationScopeLabel = computed(() => {
+  if (!selectedOrganization.value) return props.t('dashboard.allVisibleOrganizations')
+  return selectedOrganization.value.displayName?.trim() || selectedOrganization.value.name
+})
+
+const taskGroups = computed(() => {
+  const groups = new Map()
+
+  props.tasks.forEach((task) => {
+    const organizationID = String(task.organization_id || task.organization?.id || '')
+    const organization = organizationById.value.get(organizationID) || task.organization || null
+    const key = organizationID || 'unassigned'
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        organization,
+        label: organization?.displayName?.trim() || organization?.name || organizationLabel(task),
+        depth: organization?.treeDepth ?? organization?.depth ?? 0,
+        tasks: [],
+      })
+    }
+    groups.get(key).tasks.push(task)
+  })
+
+  const order = new Map(props.organizations.map((organization, index) => [String(organization.id), index]))
+  return Array.from(groups.values()).sort((left, right) => {
+    const leftOrder = order.has(left.key) ? order.get(left.key) : Number.MAX_SAFE_INTEGER
+    const rightOrder = order.has(right.key) ? order.get(right.key) : Number.MAX_SAFE_INTEGER
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder
+    return left.label.localeCompare(right.label)
+  })
+})
+
+function groupRunningCount(group) {
+  return group.tasks.filter(task => String(task.status || '').trim().toLowerCase() === 'running').length
+}
+
+function taskBelongsToOrganizationScope(task, organization) {
+  if (!organization) return false
+  const taskOrganizationID = String(task.organization_id || task.organization?.id || '')
+  if (taskOrganizationID === String(organization.id)) return true
+  const taskPath = task.organization?.path || organizationById.value.get(taskOrganizationID)?.path || ''
+  return Boolean(organization.path && taskPath && taskPath.startsWith(organization.path))
+}
 
 function totalStatusCount(breakdown = {}) {
   return ['pending', 'running', 'paused', 'completed', 'failed'].reduce((sum, key) => sum + (breakdown?.[key] || 0), 0)
@@ -262,6 +340,49 @@ function submittedLabel(value) {
       </div>
     </div>
 
+    <section class="glass-panel rounded-2xl border border-white/10 p-5">
+      <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-slate-500">
+            <Building2 class="w-4 h-4 text-cyan-300" />
+            {{ t('dashboard.organizationScope') }}
+          </div>
+          <h3 class="mt-2 text-xl font-bold text-white">{{ selectedOrganizationScopeLabel }}</h3>
+          <p class="mt-1 text-sm text-slate-400">
+            {{ t('dashboard.organizationScopeSummary', { count: formatCompactNumber(tasks.length) }) }}
+          </p>
+        </div>
+
+        <button
+          @click="emit('refresh')"
+          class="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/10"
+        >
+          <RefreshCw class="w-4 h-4" />
+          {{ t('common.refresh') }}
+        </button>
+      </div>
+
+      <div class="mt-4 flex gap-2 overflow-x-auto pb-1">
+        <button
+          v-for="option in organizationFilterOptions"
+          :key="option.id || 'all-organizations'"
+          type="button"
+          :class="[
+            'inline-flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
+            String(selectedOrganizationId || '') === String(option.id)
+              ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-100'
+              : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white'
+          ]"
+          :style="{ marginLeft: option.id ? `${Math.min(option.depth, 4) * 10}px` : '0px' }"
+          @click="emit('select-organization', option.id)"
+        >
+          <Building2 class="w-4 h-4" />
+          <span class="max-w-56 truncate">{{ option.displayName || option.label }}</span>
+          <span class="rounded-full bg-black/20 px-2 py-0.5 text-xs font-mono text-slate-400">{{ option.count }}</span>
+        </button>
+      </div>
+    </section>
+
     <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
       <section class="glass-panel rounded-2xl p-6 border border-white/10">
         <div class="flex items-center justify-between gap-3">
@@ -367,61 +488,84 @@ function submittedLabel(value) {
             </tr>
           </thead>
           <tbody v-if="tasks.length > 0" class="divide-y divide-white/5">
-            <tr
-              v-for="(task, index) in tasks"
-              :key="task.id"
-              :class="['group transition-colors duration-200', selectedTaskId === task.id ? 'bg-white/5' : 'hover:bg-white/5']"
-              :style="{ animation: `fadeInUp 0.5s ease-out ${index * 0.06}s forwards`, opacity: 0 }"
-            >
-              <td class="px-6 py-4">
-                <div class="flex items-center gap-3">
-                  <div class="p-2 rounded-xl bg-slate-800/70 border border-white/5">
-                    <FolderOpen class="w-5 h-5 text-slate-300" />
+            <template v-for="group in taskGroups" :key="group.key">
+              <tr class="bg-white/[0.03]">
+                <td colspan="9" class="px-6 py-3">
+                  <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div class="flex min-w-0 items-center gap-3">
+                      <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-cyan-500/20 bg-cyan-500/10 text-cyan-200">
+                        <Building2 class="w-4 h-4" />
+                      </div>
+                      <div class="min-w-0">
+                        <div class="truncate text-sm font-semibold text-white">{{ group.label }}</div>
+                        <div class="text-xs text-slate-500">
+                          {{ t('dashboard.organizationGroupSummary', { count: group.tasks.length, running: groupRunningCount(group) }) }}
+                        </div>
+                      </div>
+                    </div>
+                    <span class="rounded-full border border-white/10 bg-black/20 px-3 py-1 text-xs font-mono text-slate-400">
+                      {{ group.tasks.length }}
+                    </span>
                   </div>
-                  <div>
-                    <div class="font-medium text-white">{{ task.name || t('dashboard.untitledProject') }}</div>
-                    <div class="text-xs text-slate-500">{{ task.remark || t('dashboard.noRemarks') }}</div>
+                </td>
+              </tr>
+
+              <tr
+                v-for="(task, index) in group.tasks"
+                :key="task.id"
+                :class="['group transition-colors duration-200', selectedTaskId === task.id ? 'bg-white/5' : 'hover:bg-white/5']"
+                :style="{ animation: `fadeInUp 0.5s ease-out ${index * 0.04}s forwards`, opacity: 0 }"
+              >
+                <td class="px-6 py-4">
+                  <div class="flex items-center gap-3">
+                    <div class="p-2 rounded-xl bg-slate-800/70 border border-white/5">
+                      <FolderOpen class="w-5 h-5 text-slate-300" />
+                    </div>
+                    <div>
+                      <div class="font-medium text-white">{{ task.name || t('dashboard.untitledProject') }}</div>
+                      <div class="text-xs text-slate-500">{{ task.remark || t('dashboard.noRemarks') }}</div>
+                    </div>
                   </div>
-                </div>
-              </td>
-              <td class="px-6 py-4">
-                <span class="inline-flex max-w-44 items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
-                  <span class="truncate">{{ organizationLabel(task) }}</span>
-                </span>
-              </td>
-              <td class="px-6 py-4">
-                <div :class="['inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold uppercase', statusBadgeClass(task.status)]">
-                  <span v-if="task.status === 'running'" class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-                  {{ displayStatus(task.status) }}
-                </div>
-              </td>
-              <td class="px-6 py-4 text-slate-200 font-mono">{{ formatCompactNumber(task.route_count) }}</td>
-              <td class="px-6 py-4 text-slate-200 font-mono">{{ formatCompactNumber(task.finding_count) }}</td>
-              <td class="px-6 py-4">
-                <div class="flex items-center gap-3">
-                  <div class="w-28 h-2 rounded-full bg-white/5 overflow-hidden">
-                    <div class="h-full rounded-full bg-cyber-primary/80" :style="{ width: `${coveragePercent(task)}%` }"></div>
+                </td>
+                <td class="px-6 py-4">
+                  <span class="inline-flex max-w-44 items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-300">
+                    <span class="truncate">{{ organizationLabel(task) }}</span>
+                  </span>
+                </td>
+                <td class="px-6 py-4">
+                  <div :class="['inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold uppercase', statusBadgeClass(task.status)]">
+                    <span v-if="task.status === 'running'" class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+                    {{ displayStatus(task.status) }}
                   </div>
-                  <span class="text-sm text-slate-300 font-mono">{{ coverageLabel(task) }}</span>
-                </div>
-              </td>
-              <td class="px-6 py-4">
-                <span :class="['inline-flex px-3 py-1 rounded-full text-xs font-bold uppercase', severityBadgeClass(task.highest_severity)]">
-                  {{ task.highest_severity }}
-                </span>
-              </td>
-              <td class="px-6 py-4 text-slate-400 text-sm font-mono">{{ submittedLabel(task.created_at) }}</td>
-              <td class="px-6 py-4 text-right">
-                <div class="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                  <button @click="emit('open-task', task)" class="p-2 hover:bg-cyan-500/20 text-cyan-300 rounded-lg transition-colors" :title="t('dashboard.viewDetails')">
-                    <ChevronRight class="w-4 h-4" />
-                  </button>
-                  <button v-if="canDelete" @click="emit('delete-task', task.id)" class="p-2 hover:bg-rose-500/20 text-rose-300 rounded-lg transition-colors" :title="t('common.delete')">
-                    <Trash2 class="w-4 h-4" />
-                  </button>
-                </div>
-              </td>
-            </tr>
+                </td>
+                <td class="px-6 py-4 text-slate-200 font-mono">{{ formatCompactNumber(task.route_count) }}</td>
+                <td class="px-6 py-4 text-slate-200 font-mono">{{ formatCompactNumber(task.finding_count) }}</td>
+                <td class="px-6 py-4">
+                  <div class="flex items-center gap-3">
+                    <div class="w-28 h-2 rounded-full bg-white/5 overflow-hidden">
+                      <div class="h-full rounded-full bg-cyber-primary/80" :style="{ width: `${coveragePercent(task)}%` }"></div>
+                    </div>
+                    <span class="text-sm text-slate-300 font-mono">{{ coverageLabel(task) }}</span>
+                  </div>
+                </td>
+                <td class="px-6 py-4">
+                  <span :class="['inline-flex px-3 py-1 rounded-full text-xs font-bold uppercase', severityBadgeClass(task.highest_severity)]">
+                    {{ task.highest_severity }}
+                  </span>
+                </td>
+                <td class="px-6 py-4 text-slate-400 text-sm font-mono">{{ submittedLabel(task.created_at) }}</td>
+                <td class="px-6 py-4 text-right">
+                  <div class="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                    <button @click="emit('open-task', task)" class="p-2 hover:bg-cyan-500/20 text-cyan-300 rounded-lg transition-colors" :title="t('dashboard.viewDetails')">
+                      <ChevronRight class="w-4 h-4" />
+                    </button>
+                    <button v-if="canDelete" @click="emit('delete-task', task.id)" class="p-2 hover:bg-rose-500/20 text-rose-300 rounded-lg transition-colors" :title="t('common.delete')">
+                      <Trash2 class="w-4 h-4" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </template>
           </tbody>
           <tbody v-else>
             <tr>
